@@ -411,6 +411,16 @@ The project uses a streamlined GitHub Actions workflow optimized for MVP develop
 - **Security**: Dependency audit (cargo audit)
 - **Build**: Release build verification on Linux
 
+### Security Audit Workflow (.github/workflows/security-audit.yml)
+- **Schedule**: Re-runs `cargo audit` every Monday at 06:00 UTC against the default branch
+- **Purpose**: Advisories are published continuously against versions already pinned, so a
+  push-triggered audit alone leaves a blind spot between commits
+- **Behavior**: Writes the report to the job summary, opens or updates a single tracking
+  issue when findings exist, then fails the run
+- **Suppressions**: Intentional ignores live in `.cargo/audit.toml` so this workflow and the
+  CI security job cannot disagree about what is being ignored
+- **Manual runs**: Also available via `workflow_dispatch`
+
 ### Release Workflow (.github/workflows/release.yml)
 - **Platform**: Linux x86_64 binary releases
 - **Automation**: Triggered by git tags (v*) or manual dispatch
