@@ -8,6 +8,9 @@ use crate::{
 };
 
 const CREDENTIAL_VERSION_LIMIT: i32 = 10;
+/// Files can be up to 500 KB each, so retained history is capped more tightly
+/// than credentials to keep the database from growing without bound.
+const FILE_VERSION_LIMIT: i32 = 3;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SqliteSecretRepo;
@@ -41,24 +44,36 @@ impl SqliteSecretRepo {
 }
 
 impl SqliteSecretRepo {
-    fn has_credential_metadata(metadata: Option<&str>) -> bool {
-        let Some(metadata) = metadata else {
-            return false;
-        };
-        let Ok(metadata) = serde_json::from_str::<serde_json::Value>(metadata) else {
-            return false;
-        };
-
-        metadata.get("type").and_then(|value| value.as_str()) == Some("credential")
+    /// Read the plaintext `type` discriminator from a secret's metadata.
+    fn metadata_type(metadata: Option<&str>) -> Option<String> {
+        let metadata = metadata?;
+        let metadata: serde_json::Value = serde_json::from_str(metadata).ok()?;
+        metadata
+            .get("type")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
     }
 
-    fn prune_old_credential_versions(
+    /// Version retention limit for a secret, based on its metadata type.
+    ///
+    /// Returns `None` for secret types that retain full history.
+    fn version_limit_for(metadata: Option<&str>) -> Option<i32> {
+        match Self::metadata_type(metadata).as_deref() {
+            Some(crate::repo::SECRET_TYPE_CREDENTIAL) => Some(CREDENTIAL_VERSION_LIMIT),
+            Some(crate::repo::SECRET_TYPE_FILE) => Some(FILE_VERSION_LIMIT),
+            _ => None,
+        }
+    }
+
+    fn prune_old_versions(
         tx: &rusqlite::Transaction,
         namespace: &str,
         key: &str,
         latest_version: i32,
+        limit: i32,
+        secret_type: &str,
     ) -> Result<()> {
-        let oldest_version_to_delete = latest_version - CREDENTIAL_VERSION_LIMIT;
+        let oldest_version_to_delete = latest_version - limit;
         if oldest_version_to_delete <= 0 {
             return Ok(());
         }
@@ -70,8 +85,8 @@ impl SqliteSecretRepo {
 
         if deleted_count > 0 {
             info!(
-                "Pruned {} old credential versions for '{}'",
-                deleted_count, key
+                "Pruned {} old {} versions for '{}'",
+                deleted_count, secret_type, key
             );
         }
 
@@ -429,12 +444,16 @@ impl SecretRepo for SqliteSecretRepo {
             ),
         )?;
 
-        if Self::has_credential_metadata(secret.metadata.as_deref()) {
-            Self::prune_old_credential_versions(
+        if let Some(limit) = Self::version_limit_for(secret.metadata.as_deref()) {
+            let secret_type = Self::metadata_type(secret.metadata.as_deref())
+                .unwrap_or_else(|| "secret".to_string());
+            Self::prune_old_versions(
                 &tx,
                 &secret.namespace,
                 &secret.key,
                 secret.version,
+                limit,
+                &secret_type,
             )?;
         }
 
@@ -1018,6 +1037,77 @@ mod tests {
             .get_secret(&mut conn_mut, "plain-secret")
             .expect("Latest secret version should be retained");
         assert_eq!(latest.version, 11);
+    }
+
+    #[test]
+    fn test_file_versions_are_capped_at_three() {
+        let conn = setup_test_db();
+        let repo = SqliteSecretRepo;
+        let master_key = create_test_master_key();
+        let mut conn_mut = conn;
+
+        let mut latest_version = 0;
+        for index in 0..5 {
+            let secret = repo
+                .create_new_encrypted_version(
+                    &mut conn_mut,
+                    "config/app.yaml",
+                    EncryptedSecretInput {
+                        encrypted_data: vec![index],
+                        encrypted_data_key: vec![index],
+                        master_key_id: master_key.id,
+                        ttl: None,
+                        metadata: Some(r#"{"type":"file","filename":"app.yaml"}"#.to_string()),
+                    },
+                )
+                .expect("Should create file version");
+            latest_version = secret.version;
+        }
+
+        assert_eq!(latest_version, 5);
+
+        // The cap keeps the newest three versions: 3, 4 and 5.
+        assert!(
+            repo.get_secret_by_version(&mut conn_mut, "config/app.yaml", 2)
+                .is_err()
+        );
+        let retained = repo
+            .get_secret_by_version(&mut conn_mut, "config/app.yaml", 3)
+            .expect("Version 3 should be retained");
+        assert_eq!(retained.version, 3);
+
+        let latest = repo
+            .get_secret(&mut conn_mut, "config/app.yaml")
+            .expect("Latest file version should be retained");
+        assert_eq!(latest.version, 5);
+    }
+
+    #[test]
+    fn test_unknown_metadata_types_are_not_capped() {
+        let conn = setup_test_db();
+        let repo = SqliteSecretRepo;
+        let master_key = create_test_master_key();
+        let mut conn_mut = conn;
+
+        for index in 0..6 {
+            repo.create_new_encrypted_version(
+                &mut conn_mut,
+                "other-secret",
+                EncryptedSecretInput {
+                    encrypted_data: vec![index],
+                    encrypted_data_key: vec![index],
+                    master_key_id: master_key.id,
+                    ttl: None,
+                    metadata: Some(r#"{"type":"note"}"#.to_string()),
+                },
+            )
+            .expect("Should create secret version");
+        }
+
+        let version_1 = repo
+            .get_secret_by_version(&mut conn_mut, "other-secret", 1)
+            .expect("Unknown types should retain full history");
+        assert_eq!(version_1.version, 1);
     }
 
     #[test]

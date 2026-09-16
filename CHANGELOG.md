@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Encrypted file storage** - Store small files (up to 500 KB) alongside passwords and tokens
+  - Files are encrypted client-side with the same RSA + AES-GCM envelope encryption used for secrets
+  - Stored in the existing `secrets` table, so key rotation, TTL cleanup, backups, and tenant isolation work unchanged
+  - File name and optional content type are stored as plaintext metadata (`{"type":"file","filename":"...","content_type":"..."}`) for listing and search; contents stay encrypted
+  - New CLI commands: `file set`, `file get`, `file list`, `file delete`
+  - `file get` writes mode-`0600` output and refuses to overwrite without `--force`
+  - Server rejects ciphertext above the 500 KB plaintext limit with HTTP 413 on `PUT /v1/secrets/:key` and `/v2/secrets/:key`
+  - File version history is capped at the newest 3 versions
 - **Web UI (sealbox-web)** - Complete React-based web interface for secret management
   - Modern authentication system with Bearer Token support
   - Responsive secret list with real-time TTL status indicators

@@ -48,6 +48,9 @@ pub enum SealboxError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
+
     #[error("Unknown error")]
     Unknown,
 }
@@ -77,6 +80,7 @@ impl IntoResponse for SealboxError {
             SealboxError::Unauthorized => (StatusCode::UNAUTHORIZED, errorfmt(&self)),
             SealboxError::InvalidApiVersion => (StatusCode::NOT_FOUND, errorfmt(&self)),
             SealboxError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, errorfmt(&self)),
+            SealboxError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, errorfmt(&self)),
             SealboxError::Unknown => (StatusCode::INTERNAL_SERVER_ERROR, errorfmt(&self)),
         };
 

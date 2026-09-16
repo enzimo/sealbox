@@ -98,6 +98,18 @@ printf '%s\n' "db-password" | ./target/release/sealbox-cli credential set db/pos
 ./target/release/sealbox-cli credential list --username app
 ./target/release/sealbox-cli credential list --query postgres
 
+# Store a small file (up to 500 KB), encrypted client-side like any secret
+./target/release/sealbox-cli file set config/nginx --file ./nginx.conf --content-type text/plain
+
+# Retrieve and decrypt a stored file (writes mode-0600; defaults to the stored name)
+./target/release/sealbox-cli file get config/nginx --file ./restored-nginx.conf
+
+# List stored files using plaintext metadata
+./target/release/sealbox-cli file list --name config/
+
+# Delete a stored file and all of its retained versions
+./target/release/sealbox-cli file delete config/nginx
+
 # Export an encrypted archive for backup or migration
 ./target/release/sealbox-cli secret export backups/sealbox-export.tar.enc
 

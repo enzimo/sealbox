@@ -155,6 +155,23 @@ async fn tenants_isolate_identical_keys_metadata_and_deletion() {
 }
 
 #[tokio::test]
+async fn oversized_encrypted_payload_is_rejected() {
+    let server = TestServer::new();
+    let (_, token) = server.create_tenant("Tenant").await;
+    let key = server.register_key(&token, "public").await;
+
+    // One byte past the largest payload a maximum-size secret can produce.
+    let oversized = vec![0u8; sealbox_server::repo::MAX_ENCRYPTED_DATA_BYTES + 1];
+    let (status, body) = server.save_secret(&token, "too-big", &key, oversized).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+
+    // The boundary itself is accepted so a 500 KB file still round-trips.
+    let at_limit = vec![0u8; sealbox_server::repo::MAX_ENCRYPTED_DATA_BYTES];
+    let (status, body) = server.save_secret(&token, "at-limit", &key, at_limit).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn tenant_cannot_use_another_tenants_master_key() {
     let server = TestServer::new();
     let (_, token_a) = server.create_tenant("Tenant A").await;
