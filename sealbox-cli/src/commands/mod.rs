@@ -1,5 +1,6 @@
 pub mod config_commands;
 pub mod credential_commands;
+pub mod file_commands;
 pub mod input;
 pub mod key_commands;
 pub mod password_commands;

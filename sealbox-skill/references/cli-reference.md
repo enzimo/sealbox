@@ -28,6 +28,11 @@ This covers behavior and intent for command usage. Prefer exact option names fro
   - `list`
   - `history <key>`
   - `delete <key> [--version <N>]`
+- `sealbox-cli file`
+  - `set <key> --file <path> [--ttl <seconds>] [--content-type <type>]`
+  - `get <key> [--file <path>] [--version <N>] [--force]`
+  - `list [--name <substring>] [--query <substring>]`
+  - `delete <key>`
 - `sealbox-cli password`
   - `generate`
 - `sealbox-cli tenant`
@@ -50,6 +55,10 @@ This covers behavior and intent for command usage. Prefer exact option names fro
   - default is human table.
   - use `--output json` or `--output yaml` in supported commands.
 - `credential` operations include username as plaintext metadata.
+- `file` operations store small files (up to 500 KB) as secrets: contents are encrypted client-side, while the file name and optional content type are stored as plaintext metadata for listing and search.
+- `file set` refuses files larger than 500 KB locally; the server independently rejects oversized ciphertext with HTTP 413.
+- `file get` writes the decrypted file with mode `0600` and refuses to overwrite an existing path unless `--force` is passed. Without `--file`, it writes to the stored file name in the current directory.
+- `file` version history is capped at the newest 3 versions (credentials are capped at 10; other secret types retain full history).
 - `tenant` commands require root/admin token unless your deployment grants different policy.
 
 ## Configuration and environment integration

@@ -190,7 +190,7 @@ The CLI uses TOML configuration files with environment variable overrides:
 
 ### Business Endpoints (Require `Authorization: Bearer <token>` header)
 - `GET /v1/secrets` - List all secrets with metadata (key, version, timestamps, TTL)
-- `PUT /v1/secrets/:key` - Create secret version (supports TTL via `ttl` field)
+- `PUT /v1/secrets/:key` - Create secret version (supports TTL via `ttl` field; rejects `encrypted_data` above 500 KB of plaintext plus AES-GCM overhead with HTTP 413)
 - `GET /v1/secrets/:key[?version=N]` - Retrieve secret (automatic expiry check)
 - `GET /v1/secrets/:key/history` - List retained version metadata
 - `DELETE /v1/secrets/:key[?version=N]` - Delete all secret versions by default, or delete one version when `version` is provided
@@ -204,6 +204,13 @@ The CLI uses TOML configuration files with environment variable overrides:
 ## Development Status
 
 ### Completed Features
+- ✅ **Encrypted file storage** - Store small files (up to 500 KB) alongside secrets
+  - **Same envelope encryption** as passwords and tokens: files are encrypted client-side with a random data key that is wrapped by the active RSA public key
+  - **No new storage backend**: files are stored as secrets in SQLite, so key rotation, TTL cleanup, backups, and tenant isolation work unchanged
+  - **Server-visible metadata**: `{"type":"file","filename":"...","content_type":"..."}` is stored as plaintext metadata for listing and search; file contents stay encrypted
+  - **Server-side size enforcement**: `PUT /v1/secrets/:key` and `/v2/secrets/:key` reject ciphertext above the 500 KB plaintext limit with HTTP 413; request body limit raised to 4 MB on write routes only
+  - **CLI**: `file set`, `file get` (mode-0600 output, overwrite guard), `file list`, `file delete`
+  - **Version retention**: file records keep the newest 3 versions (credentials keep 10; other secret types retain full history)
 - ✅ Complete CLI architecture with robust configuration management
 - ✅ Full key management command set (generate, register, list, rotate, status)
 - ✅ Secret management with client-side encryption and client-side decryption
@@ -403,6 +410,16 @@ The project uses a streamlined GitHub Actions workflow optimized for MVP develop
 - **Testing**: Unit tests, documentation tests
 - **Security**: Dependency audit (cargo audit)
 - **Build**: Release build verification on Linux
+
+### Security Audit Workflow (.github/workflows/security-audit.yml)
+- **Schedule**: Re-runs `cargo audit` every Monday at 06:00 UTC against the default branch
+- **Purpose**: Advisories are published continuously against versions already pinned, so a
+  push-triggered audit alone leaves a blind spot between commits
+- **Behavior**: Writes the report to the job summary, opens or updates a single tracking
+  issue when findings exist, then fails the run
+- **Suppressions**: Intentional ignores live in `.cargo/audit.toml` so this workflow and the
+  CI security job cannot disagree about what is being ignored
+- **Manual runs**: Also available via `workflow_dispatch`
 
 ### Release Workflow (.github/workflows/release.yml)
 - **Platform**: Linux x86_64 binary releases

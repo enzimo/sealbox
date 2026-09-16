@@ -26,7 +26,7 @@ This document maps Sealbox HTTP behavior at a task level.
 
 - `GET /v1/secrets`
   - List latest secret metadata for all keys.
-- `PUT /v1/secrets/:key`
+- `PUT /v1/secrets/:key` (payload `encrypted_data` is capped at 500 KB of plaintext plus AES-GCM overhead; larger ciphertext is rejected with HTTP 413)
   - Create a new secret version.
   - Body contains encrypted secret envelope and metadata.
   - Optional TTL handling by `ttl` in seconds.
@@ -51,6 +51,19 @@ This document maps Sealbox HTTP behavior at a task level.
   - List credential version metadata.
 - `DELETE /v1/credentials/:key`
   - Delete latest or specific version with `?version=<N>`.
+
+### Stored files
+
+Stored files use the same secret endpoints and envelope encryption. There is no
+separate file resource: a file is a secret whose plaintext metadata carries
+`{"type":"file","filename":"app.yaml","content_type":"text/yaml"}`.
+
+- `PUT /v1/secrets/:key`
+  - Encrypts the file client-side; the server stores the ciphertext envelope.
+  - Capped at 500 KB of plaintext plus AES-GCM overhead; larger ciphertext is rejected with HTTP 413.
+- `GET /v1/secrets/:key`
+  - Returns the ciphertext for client-side decryption.
+- Version retention for `type: "file"` records is capped at the newest 3 versions.
 
 ### Master keys
 

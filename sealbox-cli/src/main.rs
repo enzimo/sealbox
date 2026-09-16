@@ -3,8 +3,8 @@ mod config;
 mod output;
 
 use crate::commands::{
-    config_commands, credential_commands, key_commands, password_commands, secret_commands,
-    tenant_commands,
+    config_commands, credential_commands, file_commands, key_commands, password_commands,
+    secret_commands, tenant_commands,
 };
 use crate::config::{Config, OutputFormat, normalize_api_version};
 use anyhow::Result;
@@ -85,6 +85,11 @@ enum Commands {
     Credential {
         #[command(subcommand)]
         command: CredentialCommands,
+    },
+    /// Store and retrieve small encrypted files (up to 500 KB)
+    File {
+        #[command(subcommand)]
+        command: FileCommands,
     },
     /// Generate strong passwords
     Password {
@@ -310,6 +315,52 @@ enum CredentialCommands {
 }
 
 #[derive(Subcommand)]
+enum FileCommands {
+    /// Store an encrypted file from disk
+    Set {
+        /// File key name used to address the stored file
+        key: String,
+        /// Path to the file to encrypt and upload
+        #[arg(long)]
+        file: String,
+        /// Time to live in seconds
+        #[arg(long)]
+        ttl: Option<i64>,
+        /// Optional content type recorded in plaintext metadata
+        #[arg(long)]
+        content_type: Option<String>,
+    },
+    /// Retrieve, decrypt, and write a stored file to disk
+    Get {
+        /// File key name
+        key: String,
+        /// Destination path (defaults to the stored file name)
+        #[arg(long)]
+        file: Option<String>,
+        /// Specific version number
+        #[arg(long)]
+        version: Option<i32>,
+        /// Overwrite the destination file if it already exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// List stored files using plaintext metadata
+    List {
+        /// Filter by file key substring
+        #[arg(long, visible_alias = "key")]
+        name: Option<String>,
+        /// Filter by file key or stored file name substring
+        #[arg(long)]
+        query: Option<String>,
+    },
+    /// Delete a stored file and all its versions
+    Delete {
+        /// File key name
+        key: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum TenantCommands {
     /// Create a tenant and write its initial API token to a private file
     Create {
@@ -390,6 +441,7 @@ async fn main() -> Result<()> {
         Commands::Credential { command } => {
             credential_commands::handle_command(command, &config).await
         }
+        Commands::File { command } => file_commands::handle_command(command, &config).await,
         Commands::Password { command } => password_commands::handle_command(command, &config).await,
         Commands::Tenant { command } => tenant_commands::handle_command(command, &config).await,
     }
@@ -564,6 +616,130 @@ mod tests {
                 assert_eq!(key, "db/postgres");
             }
             _ => panic!("Expected credential history command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_file_set() {
+        let cli = Cli::try_parse_from([
+            "sealbox",
+            "file",
+            "set",
+            "config/app",
+            "--file",
+            "./app.yaml",
+            "--ttl",
+            "3600",
+            "--content-type",
+            "text/yaml",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::File {
+                command:
+                    FileCommands::Set {
+                        key,
+                        file,
+                        ttl,
+                        content_type,
+                    },
+            } => {
+                assert_eq!(key, "config/app");
+                assert_eq!(file, "./app.yaml");
+                assert_eq!(ttl, Some(3600));
+                assert_eq!(content_type.as_deref(), Some("text/yaml"));
+            }
+            _ => panic!("Expected file set command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_file_get_defaults() {
+        let cli = Cli::try_parse_from(["sealbox", "file", "get", "config/app"]).unwrap();
+
+        match cli.command {
+            Commands::File {
+                command:
+                    FileCommands::Get {
+                        key,
+                        file,
+                        version,
+                        force,
+                    },
+            } => {
+                assert_eq!(key, "config/app");
+                assert!(file.is_none());
+                assert!(version.is_none());
+                assert!(!force);
+            }
+            _ => panic!("Expected file get command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_file_get_force_and_version() {
+        let cli = Cli::try_parse_from([
+            "sealbox",
+            "file",
+            "get",
+            "config/app",
+            "--file",
+            "./restored.yaml",
+            "--version",
+            "2",
+            "--force",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::File {
+                command:
+                    FileCommands::Get {
+                        key,
+                        file,
+                        version,
+                        force,
+                    },
+            } => {
+                assert_eq!(key, "config/app");
+                assert_eq!(file.as_deref(), Some("./restored.yaml"));
+                assert_eq!(version, Some(2));
+                assert!(force);
+            }
+            _ => panic!("Expected file get command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_file_list_filters() {
+        let cli = Cli::try_parse_from([
+            "sealbox", "file", "list", "--name", "config/", "--query", "app",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::File {
+                command: FileCommands::List { name, query },
+            } => {
+                assert_eq!(name.as_deref(), Some("config/"));
+                assert_eq!(query.as_deref(), Some("app"));
+            }
+            _ => panic!("Expected file list command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_file_delete() {
+        let cli = Cli::try_parse_from(["sealbox", "file", "delete", "config/app"]).unwrap();
+
+        match cli.command {
+            Commands::File {
+                command: FileCommands::Delete { key },
+            } => {
+                assert_eq!(key, "config/app");
+            }
+            _ => panic!("Expected file delete command"),
         }
     }
 }

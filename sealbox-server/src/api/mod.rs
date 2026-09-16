@@ -1,6 +1,6 @@
 use axum::{
     Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderName, Request},
     middleware::from_fn_with_state,
     response::{IntoResponse, Response},
@@ -25,6 +25,7 @@ use crate::{
     },
     config::SealboxConfig,
     error::{Result, SealboxError},
+    repo::MAX_SECRET_REQUEST_BYTES,
 };
 
 mod auth;
@@ -84,7 +85,12 @@ pub fn create_app(config: &SealboxConfig) -> Result<Router> {
         )
         .route(
             "/{version}/secrets/{secret_key}",
-            get(secret::get).put(secret::save).delete(secret::delete),
+            get(secret::get)
+                .put(secret::save)
+                .delete(secret::delete)
+                // Stored files raise the request body ceiling above axum's 2 MB
+                // default; handler-level checks still bound the payload.
+                .layer(DefaultBodyLimit::max(MAX_SECRET_REQUEST_BYTES)),
         )
         .route(
             "/{version}/master-key",
@@ -114,7 +120,8 @@ pub fn create_app(config: &SealboxConfig) -> Result<Router> {
             "/v2/secrets/{secret_key}",
             get(secret::get_v2)
                 .put(secret::save_v2)
-                .delete(secret::delete_v2),
+                .delete(secret::delete_v2)
+                .layer(DefaultBodyLimit::max(MAX_SECRET_REQUEST_BYTES)),
         )
         .route(
             "/v2/master-key",

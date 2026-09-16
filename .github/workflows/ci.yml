@@ -74,10 +74,12 @@ jobs:
     
     - name: Install cargo-audit
       run: cargo install cargo-audit
-    
+
+    # Suppressions live in .cargo/audit.toml so this job and the scheduled
+    # Security Audit workflow stay in sync. RUSTSEC-2023-0071 (RSA timing
+    # sidechannel) is ignored there: medium risk, no fix available.
     - name: Run security audit
-      # Note: Ignoring RUSTSEC-2023-0071 (RSA timing sidechannel) - medium risk, no fix available
-      run: cargo audit --ignore RUSTSEC-2023-0071
+      run: cargo audit
 
   build:
     name: Build

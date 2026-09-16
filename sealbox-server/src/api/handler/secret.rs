@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::{
     api::{SealboxResponse, Version, auth::TenantPrincipal, path::Path, state::AppState},
     error::{Result, SealboxError},
-    repo::{EncryptedSecretInput, LEGACY_TENANT_ID},
+    repo::{EncryptedSecretInput, LEGACY_TENANT_ID, MAX_ENCRYPTED_DATA_BYTES},
 };
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -99,6 +99,22 @@ pub(crate) struct SaveSecretPayload {
     metadata: Option<String>,
 }
 
+/// Reject ciphertext envelopes larger than a maximum-size secret can produce.
+///
+/// The server never sees the plaintext, so it validates the encrypted payload
+/// against `MAX_ENCRYPTED_DATA_BYTES` (500 KB plaintext plus AES-GCM envelope
+/// overhead). This keeps clients from writing unbounded blobs to the database.
+fn validate_encrypted_data_size(payload: &SaveSecretPayload) -> Result<()> {
+    if payload.encrypted_data.len() > MAX_ENCRYPTED_DATA_BYTES {
+        return Err(SealboxError::PayloadTooLarge(format!(
+            "encrypted_data is {} bytes; the maximum stored secret is {} bytes of plaintext",
+            payload.encrypted_data.len(),
+            crate::repo::MAX_SECRET_PLAINTEXT_BYTES
+        )));
+    }
+    Ok(())
+}
+
 // PUT /{version}/secrets/{secret_key}
 pub(crate) async fn save(
     State(state): State<AppState>,
@@ -107,6 +123,7 @@ pub(crate) async fn save(
 ) -> Result<SealboxResponse> {
     match params.version() {
         Version::V1 => {
+            validate_encrypted_data_size(&payload)?;
             let mut conn = state.conn_pool.lock()?;
             let master_key = state
                 .master_key_repo
@@ -282,6 +299,7 @@ pub(crate) async fn save_v2(
     Path(params): Path<TenantSecretPathParams>,
     Json(payload): Json<SaveSecretPayload>,
 ) -> Result<SealboxResponse> {
+    validate_encrypted_data_size(&payload)?;
     let mut conn = state.conn_pool.lock()?;
     let master_key = state
         .master_key_repo

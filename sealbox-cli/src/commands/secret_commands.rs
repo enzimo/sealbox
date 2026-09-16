@@ -161,6 +161,42 @@ pub async fn save_secret_value(
     ttl: Option<i64>,
     metadata: Option<String>,
 ) -> Result<()> {
+    save_secret_bytes(config, output, key, secret_value.as_bytes(), ttl, metadata).await
+}
+
+/// Encrypt and store an arbitrary byte payload.
+///
+/// This is the shared write path for both text secrets and stored files. The
+/// caller is responsible for honoring [`sealbox_server::repo::MAX_SECRET_PLAINTEXT_BYTES`];
+/// the server independently bounds the encrypted payload.
+pub async fn save_secret_bytes(
+    config: &Config,
+    output: &OutputManager,
+    key: String,
+    secret_bytes: &[u8],
+    ttl: Option<i64>,
+    metadata: Option<String>,
+) -> Result<()> {
+    let result =
+        encrypt_and_store(config, output, key.clone(), secret_bytes, ttl, metadata).await?;
+
+    output.print_success(&format!("Secret '{key}' saved successfully!"));
+    output.print_value(&result)?;
+    Ok(())
+}
+
+/// Encrypt and store a payload, returning the server response.
+///
+/// Callers that store large payloads (such as files) should summarize the
+/// response instead of printing it, because it echoes the ciphertext.
+async fn encrypt_and_store(
+    config: &Config,
+    output: &OutputManager,
+    key: String,
+    secret_bytes: &[u8],
+    ttl: Option<i64>,
+    metadata: Option<String>,
+) -> Result<Value> {
     output.print_info("Fetching active master key...");
 
     let master_key = fetch_active_master_key(config).await?;
@@ -168,7 +204,7 @@ pub async fn save_secret_value(
         .context("Failed to parse active master public key")?;
     let data_key = DataKey::new();
     let encrypted_data = data_key
-        .encrypt(secret_value.as_bytes())
+        .encrypt(secret_bytes)
         .context("Failed to encrypt secret locally")?;
     let encrypted_data_key = public_key
         .encrypt(data_key.as_bytes())
@@ -194,15 +230,7 @@ pub async fn save_secret_value(
         .context("Failed to request server")?;
 
     let status = response.status();
-    if status.is_success() {
-        let result: Value = response
-            .json()
-            .await
-            .context("Failed to parse server response")?;
-
-        output.print_success(&format!("Secret '{key}' saved successfully!"));
-        output.print_value(&result)?;
-    } else {
+    if !status.is_success() {
         let error_body = response
             .text()
             .await
@@ -214,7 +242,49 @@ pub async fn save_secret_value(
         );
     }
 
+    response
+        .json()
+        .await
+        .context("Failed to parse server response")
+}
+
+/// Encrypt and store an arbitrary byte payload, printing a size summary
+/// instead of echoing the encrypted payload back to the terminal.
+pub async fn save_secret_bytes_summary(
+    config: &Config,
+    output: &OutputManager,
+    key: String,
+    secret_bytes: &[u8],
+    ttl: Option<i64>,
+    metadata: Option<String>,
+) -> Result<()> {
+    let plaintext_bytes = secret_bytes.len();
+    let result =
+        encrypt_and_store(config, output, key.clone(), secret_bytes, ttl, metadata).await?;
+
+    output.print_success(&format!(
+        "Stored {plaintext_bytes} bytes as '{key}' successfully!"
+    ));
+    output.print_value(&json!({
+        "key": key,
+        "version": result.get("version"),
+        "expires_at": result.get("expires_at"),
+        "metadata": result.get("metadata"),
+        "bytes": plaintext_bytes,
+    }))?;
     Ok(())
+}
+
+/// Decrypted secret payload without assuming the bytes are UTF-8.
+///
+/// Stored files may be arbitrary binary data, so the file commands use this
+/// form and only text-based commands decode to a string.
+pub struct DecryptedSecretBytes {
+    pub key: String,
+    pub bytes: Vec<u8>,
+    pub version: i32,
+    pub expires_at: Option<i64>,
+    pub metadata: Option<String>,
 }
 
 pub async fn fetch_decrypted_secret(
@@ -222,6 +292,23 @@ pub async fn fetch_decrypted_secret(
     key: &str,
     version: Option<i32>,
 ) -> Result<DecryptedSecret> {
+    let decrypted = fetch_decrypted_secret_bytes(config, key, version).await?;
+    let value = String::from_utf8(decrypted.bytes).context("Decrypted data is not valid UTF-8")?;
+
+    Ok(DecryptedSecret {
+        key: decrypted.key,
+        value,
+        version: decrypted.version,
+        expires_at: decrypted.expires_at,
+        metadata: decrypted.metadata,
+    })
+}
+
+pub async fn fetch_decrypted_secret_bytes(
+    config: &Config,
+    key: &str,
+    version: Option<i32>,
+) -> Result<DecryptedSecretBytes> {
     config
         .validate()
         .context("Configuration validation failed")?;
@@ -272,12 +359,9 @@ pub async fn fetch_decrypted_secret(
         .decrypt(&secret_data.encrypted_data)
         .context("Failed to decrypt secret data")?;
 
-    let decrypted_value =
-        String::from_utf8(decrypted_bytes).context("Decrypted data is not valid UTF-8")?;
-
-    Ok(DecryptedSecret {
+    Ok(DecryptedSecretBytes {
         key: secret_data.key,
-        value: decrypted_value,
+        bytes: decrypted_bytes,
         version: secret_data.version,
         expires_at: secret_data.expires_at,
         metadata: secret_data.metadata,

@@ -19,6 +19,71 @@ mod sqlite;
 
 pub const LEGACY_TENANT_ID: &str = "legacy";
 
+/// Maximum plaintext size, in bytes, accepted for a stored secret value.
+///
+/// This is the user-facing limit (500 KB) and is enforced by the CLI before it
+/// encrypts a file, so oversized data never leaves the client.
+pub const MAX_SECRET_PLAINTEXT_BYTES: usize = 500 * 1024;
+
+/// AES-GCM envelope overhead: a 12-byte nonce plus a 16-byte authentication tag.
+pub const SECRET_ENVELOPE_OVERHEAD: usize = 12 + 16;
+
+/// Maximum accepted size, in bytes, of the `encrypted_data` field.
+///
+/// The server cannot recover the plaintext size, so it bounds the ciphertext
+/// envelope instead. A payload at the plaintext limit plus envelope overhead is
+/// the largest a well-behaved client can produce.
+pub const MAX_ENCRYPTED_DATA_BYTES: usize = MAX_SECRET_PLAINTEXT_BYTES + SECRET_ENVELOPE_OVERHEAD;
+
+/// Maximum accepted request body size, in bytes, for secret write routes.
+///
+/// `encrypted_data` is a `Vec<u8>`, which serde transports as a JSON array of
+/// numbers (up to ~4 bytes per byte of ciphertext). This bound leaves headroom
+/// above the worst-case encoding of a maximum-size secret while still rejecting
+/// absurd payloads before they are buffered.
+pub const MAX_SECRET_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Metadata discriminator stored in plaintext for a stored file.
+pub const SECRET_TYPE_FILE: &str = "file";
+/// Metadata discriminator stored in plaintext for a credential.
+pub const SECRET_TYPE_CREDENTIAL: &str = "credential";
+
+/// Plaintext, server-visible metadata for a stored file.
+///
+/// The file contents are never part of this struct; only the name and content
+/// type are stored in plaintext so the web UI can search and display them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMetadata {
+    #[serde(rename = "type")]
+    pub secret_type: String,
+    pub filename: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+impl FileMetadata {
+    pub fn new(filename: impl Into<String>, content_type: Option<String>) -> Self {
+        Self {
+            secret_type: SECRET_TYPE_FILE.to_string(),
+            filename: filename.into(),
+            content_type,
+        }
+    }
+
+    /// Serialize into the plaintext metadata column.
+    pub fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| crate::error::SealboxError::InvalidRequest(error.to_string()))
+    }
+
+    /// Parse metadata, returning `None` when it is not a file record.
+    pub fn parse(metadata: Option<&str>) -> Option<Self> {
+        let metadata = metadata?;
+        let value: Self = serde_json::from_str(metadata).ok()?;
+        (value.secret_type == SECRET_TYPE_FILE).then_some(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretInfo {
     pub key: String,              // Secret key identifier
