@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "sealbox")]
 #[command(author = "Sealbox Team")]
-#[command(version = "1.0.0")]
+#[command(version)]
 #[command(about = "Sealbox CLI - client-encrypted secret management tool")]
 #[command(
     long_about = "Sealbox is a lightweight, single-node secret storage service where the CLI encrypts secrets locally using RSA key pairs."

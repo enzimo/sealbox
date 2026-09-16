@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-16
+
 ### Added
 - **Encrypted file storage** - Store small files (up to 500 KB) alongside passwords and tokens
   - Files are encrypted client-side with the same RSA + AES-GCM envelope encryption used for secrets
@@ -52,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Upgraded tower-http dependency with CORS feature support
 
 ### Security
+- Resolved 14 of 15 RUSTSEC advisories reported by `cargo audit`, including
+  `aws-lc-sys`, `rustls`, `rustls-webpki`, `h2`, `bytes`, and `slab`
+- Dependency audit suppressions are centralized in `.cargo/audit.toml`
+- Added a scheduled dependency audit workflow that re-checks the default branch weekly
 - Added comprehensive cryptographic testing
 - Implemented security scanning in CI pipeline
 - Added vulnerability scanning for Docker images
@@ -80,5 +86,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded SQLite storage
 - CLI tools for management
 
-[Unreleased]: https://github.com/realmorrisliu/sealbox/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/realmorrisliu/sealbox/releases/tag/v0.1.0
+[Unreleased]: https://github.com/enzimo/sealbox/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/enzimo/sealbox/compare/v0.1.0...v0.1.5
+[0.1.0]: https://github.com/enzimo/sealbox/releases/tag/v0.1.0

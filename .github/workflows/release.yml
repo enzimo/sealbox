@@ -7,72 +7,40 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release'
+        description: 'Version to release (must be an existing tag, e.g. v0.1.5)'
         required: true
-        default: 'v0.1.0'
 
 env:
   CARGO_TERM_COLOR: always
 
-jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      version: ${{ steps.get_version.outputs.version }}
-    steps:
-    - name: Get version
-      id: get_version
-      run: |
-        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-        else
-          echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-        fi
-    
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.get_version.outputs.version }}
-        release_name: Sealbox ${{ steps.get_version.outputs.version }}
-        body: |
-          ## What's Changed
-          
-          - See the [CHANGELOG](CHANGELOG.md) for detailed changes
-          
-          ## Download
-          
-          Download the Linux x86_64 binary: `sealbox-${{ steps.get_version.outputs.version }}-linux-x86_64.tar.gz`
-          
-          ## Quick Start
-          
-          ```bash
-          # Extract the archive
-          tar -xzf sealbox-${{ steps.get_version.outputs.version }}-linux-x86_64.tar.gz
-          
-          # Run the server
-          STORE_PATH=/tmp/sealbox.db \
-          AUTH_TOKEN=your-secret-token \
-          LISTEN_ADDR=127.0.0.1:8080 \
-          ./sealbox-server
-          ```
-        draft: false
-        prerelease: false
+# The release is created with the workflow's own GITHUB_TOKEN. An org-owned
+# repository does not necessarily grant write access by default, so request
+# exactly what publishing needs rather than relying on the repo setting.
+permissions:
+  contents: write
 
-  build-release:
-    name: Build Release
-    needs: create-release
+jobs:
+  release:
+    name: Build and Publish
     runs-on: ubuntu-latest
     steps:
+    - name: Resolve version
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Check out the tag being released, not the tip of the default branch.
     - uses: actions/checkout@v7
-    
+      with:
+        ref: ${{ steps.version.outputs.version }}
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
-    
+
     - name: Cache cargo
       uses: actions/cache@v6
       with:
@@ -81,25 +49,63 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-    
-    - name: Build release binary
-      run: cargo build --release --all-features
-    
-    - name: Create archive
+        restore-keys: |
+          ${{ runner.os }}-cargo-release-
+
+    - name: Build release binaries
+      run: cargo build --release --locked --all-features --workspace
+
+    - name: Verify binary versions match the tag
+      env:
+        RELEASE_VERSION: ${{ steps.version.outputs.version }}
+      run: |
+        expected="${RELEASE_VERSION#v}"
+        actual=$(./target/release/sealbox-cli --version | awk '{print $2}')
+        echo "tag=$expected cli=$actual"
+        if [ "$expected" != "$actual" ]; then
+          echo "::error::tag $RELEASE_VERSION does not match binary version $actual"
+          exit 1
+        fi
+
+    - name: Assemble archive
+      env:
+        RELEASE_VERSION: ${{ steps.version.outputs.version }}
       run: |
         mkdir -p release
         cp target/release/sealbox-server release/
         cp target/release/sealbox-cli release/
         cp README.md LICENSE release/
-        cd release
-        tar czf ../sealbox-${{ needs.create-release.outputs.version }}-linux-x86_64.tar.gz *
-    
-    - name: Upload release asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        tar czf "sealbox-${RELEASE_VERSION}-linux-x86_64.tar.gz" -C release .
+        sha256sum "sealbox-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "sealbox-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
+
+    - name: Publish release
+      uses: softprops/action-gh-release@v3
       with:
-        upload_url: ${{ needs.create-release.outputs.upload_url }}
-        asset_path: ./sealbox-${{ needs.create-release.outputs.version }}-linux-x86_64.tar.gz
-        asset_name: sealbox-${{ needs.create-release.outputs.version }}-linux-x86_64.tar.gz
-        asset_content_type: application/gzip
+        tag_name: ${{ steps.version.outputs.version }}
+        name: Sealbox ${{ steps.version.outputs.version }}
+        generate_release_notes: true
+        body: |
+          ## Download
+
+          Linux x86_64 binaries (`sealbox-server` and `sealbox-cli`):
+
+          ```
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/sealbox-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
+          sha256sum -c sealbox-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz.sha256
+          tar -xzf sealbox-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
+          ```
+
+          ## Quick start
+
+          ```
+          STORE_PATH=/tmp/sealbox.db \
+          AUTH_TOKEN=your-secret-token \
+          LISTEN_ADDR=127.0.0.1:8080 \
+          ./sealbox-server
+          ```
+
+          See the [CHANGELOG](CHANGELOG.md) for details.
+        files: |
+          sealbox-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
+          sealbox-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz.sha256
+        fail_on_unmatched_files: true
