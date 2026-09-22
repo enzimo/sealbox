@@ -30,8 +30,19 @@ fn new_padding() -> Oaep<Sha256> {
     Oaep::<Sha256>::new()
 }
 
-#[derive(Debug)]
 pub struct PrivateMasterKey(RsaPrivateKey);
+
+/// Redact the key material.
+///
+/// The derived `Debug` would print the private exponent and prime factors on
+/// any `{:?}`, so a single debug log, `dbg!`, or formatted error would leak the
+/// key that all stored secrets depend on. The hand-written impl keeps `Debug`
+/// available without making that possible.
+impl std::fmt::Debug for PrivateMasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrivateMasterKey(<redacted>)")
+    }
+}
 
 impl PrivateMasterKey {
     /// Decrypt data using private key
@@ -381,6 +392,41 @@ mod tests {
             MasterKeyCryptoError::FailedToEncrypt(_) => {} // Expected
             _ => panic!("Expected FailedToEncrypt error"),
         }
+    }
+
+    #[test]
+    fn test_private_key_debug_is_redacted() {
+        let (private_pem, _) = generate_key_pair().expect("Should generate key pair");
+        let private_key: PrivateMasterKey = private_pem.parse().expect("Should parse private key");
+
+        let rendered = format!("{private_key:?}");
+
+        assert_eq!(rendered, "PrivateMasterKey(<redacted>)");
+
+        // The derived Debug printed the private exponent and primes. Assert the
+        // output carries no key material rather than only checking the label.
+        for line in private_pem
+            .lines()
+            .filter(|line| !line.starts_with("-----") && !line.trim().is_empty())
+        {
+            assert!(
+                !rendered.contains(line.trim()),
+                "Debug output leaked private key material"
+            );
+        }
+    }
+
+    #[test]
+    fn test_private_key_debug_redacted_in_nested_formatting() {
+        let (private_pem, _) = generate_key_pair().expect("Should generate key pair");
+        let private_key: PrivateMasterKey = private_pem.parse().expect("Should parse private key");
+
+        // A key nested in a container or error chain must stay redacted too.
+        let nested = format!("{:?}", vec![&private_key]);
+
+        assert!(nested.contains("<redacted>"));
+        assert!(!nested.contains("RsaPrivateKey"));
+        assert!(!nested.contains("primes"));
     }
 
     #[test]
