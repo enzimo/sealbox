@@ -54,15 +54,23 @@ export LISTEN_ADDR=127.0.0.1:8080
 
 ### Setting Up the CLI
 
+Data commands use a **tenant token**. The server's `AUTH_TOKEN` is the root
+credential, and it is only used to create tenants and issue their tokens.
+
 ```bash
-# Initialize configuration
-./target/release/sealbox-cli config init
+# Create a tenant with the root token. Its API token is written once to a 0600 file.
+./target/release/sealbox-cli --url http://localhost:8080 --token your-secret-token \
+  tenant create --display-name "Personal" --token-file ~/.config/sealbox/tenant_token
 
-# Generate RSA key pair
+# Save the tenant token in the CLI configuration
+./target/release/sealbox-cli config init --url http://localhost:8080 \
+  --token "$(cat ~/.config/sealbox/tenant_token)" \
+  --public-key ~/.config/sealbox/public_key.pem \
+  --private-key ~/.config/sealbox/private_key.pem
+
+# Generate an RSA key pair and register the public key for this tenant
 ./target/release/sealbox-cli key generate
-
-# Register public key with server
-./target/release/sealbox-cli key register --url http://localhost:8080 --token your-secret-token
+./target/release/sealbox-cli key register
 ```
 
 ### Managing Secrets
@@ -111,10 +119,13 @@ printf '%s\n' "db-password" | ./target/release/sealbox-cli credential set db/pos
 ./target/release/sealbox-cli file delete config/nginx
 
 # Export an encrypted archive for backup or migration
-./target/release/sealbox-cli secret export backups/sealbox-export.tar.enc
+./target/release/sealbox-cli secret export backups/sealbox-export.json
 
 # Import an encrypted archive into the current server
-./target/release/sealbox-cli secret import backups/sealbox-export.tar.enc
+./target/release/sealbox-cli secret import backups/sealbox-export.json
+
+# Back up your key pair (passphrase-encrypted)
+./target/release/sealbox-cli key export --file backups/sealbox-keys.bundle
 
 # List all commands
 ./target/release/sealbox-cli --help
@@ -136,8 +147,7 @@ sealbox-cli tenant create \
   --token-label initial \
   --token-file /secure/application-a/token
 
-# Tenant data client. The server does not need these key files.
-export SEALBOX_API_VERSION=v2
+# Tenant data client (v2 is the default API). The server does not need these key files.
 export SEALBOX_TOKEN_FILE=/secure/application-a/token
 export SEALBOX_PUBLIC_KEY_FILE=/secure/application-a/public.pem
 export SEALBOX_PRIVATE_KEY_FILE=/secure/application-a/private.pem
@@ -192,6 +202,23 @@ curl -fsS http://127.0.0.1:8080/healthz/ready
 
 `AUTH_TOKEN_FILE` is read by the server as the root bearer-token contents. The server does not need tenant token, public-key, or private-key files.
 
+### Create a Tenant
+
+Secret and key commands authenticate with a tenant token, not the root token.
+Use the root token once to create a tenant and write its token file:
+
+```bash
+docker run --rm \
+  --network container:sealbox \
+  --user "$(id -u):$(id -g)" \
+  --workdir /tmp \
+  -v "$PWD/.sealbox-secrets:/secrets" \
+  -e SEALBOX_URL=http://127.0.0.1:8080 \
+  -e SEALBOX_TOKEN_FILE=/secrets/auth_token \
+  sealbox:local \
+  sealbox-cli tenant create --display-name "Default" --token-file /secrets/tenant_token
+```
+
 ### Generate and Register Keys
 
 Use the same image as a CLI container. `--network container:sealbox` lets the CLI reach the server at `http://127.0.0.1:8080` without publishing extra ports.
@@ -214,17 +241,17 @@ docker run --rm \
   --network container:sealbox \
   --user "$(id -u):$(id -g)" \
   --workdir /tmp \
-  -v "$PWD/.sealbox-secrets/auth_token:/run/secrets/sealbox_auth_token:ro" \
+  -v "$PWD/.sealbox-secrets/tenant_token:/run/secrets/sealbox_tenant_token:ro" \
   -v "$PWD/.sealbox-keys:/keys:ro" \
   -e SEALBOX_URL=http://127.0.0.1:8080 \
-  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_auth_token \
+  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_tenant_token \
   -e SEALBOX_PUBLIC_KEY_FILE=/keys/public_key.pem \
   -e SEALBOX_PRIVATE_KEY_FILE=/keys/private_key.pem \
   sealbox:local \
   sealbox-cli key register
 ```
 
-`SEALBOX_TOKEN_FILE` is read by the CLI as the bearer-token contents. `SEALBOX_PUBLIC_KEY_FILE` and `SEALBOX_PRIVATE_KEY_FILE` are paths to mounted PEM key files.
+`SEALBOX_TOKEN_FILE` is read by the CLI as the bearer-token contents (here, the tenant token). `SEALBOX_PUBLIC_KEY_FILE` and `SEALBOX_PRIVATE_KEY_FILE` are paths to mounted PEM key files.
 
 ### Store and Retrieve Secrets
 
@@ -235,10 +262,10 @@ docker run --rm -it \
   --network container:sealbox \
   --user "$(id -u):$(id -g)" \
   --workdir /tmp \
-  -v "$PWD/.sealbox-secrets/auth_token:/run/secrets/sealbox_auth_token:ro" \
+  -v "$PWD/.sealbox-secrets/tenant_token:/run/secrets/sealbox_tenant_token:ro" \
   -v "$PWD/.sealbox-keys:/keys:ro" \
   -e SEALBOX_URL=http://127.0.0.1:8080 \
-  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_auth_token \
+  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_tenant_token \
   -e SEALBOX_PUBLIC_KEY_FILE=/keys/public_key.pem \
   -e SEALBOX_PRIVATE_KEY_FILE=/keys/private_key.pem \
   sealbox:local \
@@ -248,10 +275,10 @@ docker run --rm \
   --network container:sealbox \
   --user "$(id -u):$(id -g)" \
   --workdir /tmp \
-  -v "$PWD/.sealbox-secrets/auth_token:/run/secrets/sealbox_auth_token:ro" \
+  -v "$PWD/.sealbox-secrets/tenant_token:/run/secrets/sealbox_tenant_token:ro" \
   -v "$PWD/.sealbox-keys:/keys:ro" \
   -e SEALBOX_URL=http://127.0.0.1:8080 \
-  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_auth_token \
+  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_tenant_token \
   -e SEALBOX_PUBLIC_KEY_FILE=/keys/public_key.pem \
   -e SEALBOX_PRIVATE_KEY_FILE=/keys/private_key.pem \
   sealbox:local \
@@ -265,10 +292,10 @@ docker run --rm -it \
   --network container:sealbox \
   --user "$(id -u):$(id -g)" \
   --workdir /tmp \
-  -v "$PWD/.sealbox-secrets/auth_token:/run/secrets/sealbox_auth_token:ro" \
+  -v "$PWD/.sealbox-secrets/tenant_token:/run/secrets/sealbox_tenant_token:ro" \
   -v "$PWD/.sealbox-keys:/keys:ro" \
   -e SEALBOX_URL=http://127.0.0.1:8080 \
-  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_auth_token \
+  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_tenant_token \
   -e SEALBOX_PUBLIC_KEY_FILE=/keys/public_key.pem \
   -e SEALBOX_PRIVATE_KEY_FILE=/keys/private_key.pem \
   sealbox:local \
@@ -292,10 +319,10 @@ docker run --rm \
   --network container:sealbox \
   --user "$(id -u):$(id -g)" \
   --workdir /tmp \
-  -v "$PWD/.sealbox-secrets/auth_token:/run/secrets/sealbox_auth_token:ro" \
+  -v "$PWD/.sealbox-secrets/tenant_token:/run/secrets/sealbox_tenant_token:ro" \
   -v "$PWD/.sealbox-keys:/keys:ro" \
   -e SEALBOX_URL=http://127.0.0.1:8080 \
-  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_auth_token \
+  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_tenant_token \
   -e SEALBOX_PUBLIC_KEY_FILE=/keys/public_key.pem \
   -e SEALBOX_PRIVATE_KEY_FILE=/keys/private_key.pem \
   sealbox:local \
@@ -313,10 +340,10 @@ printf '%s\n' "db-password" | docker run --rm -i \
   --network container:sealbox \
   --user "$(id -u):$(id -g)" \
   --workdir /tmp \
-  -v "$PWD/.sealbox-secrets/auth_token:/run/secrets/sealbox_auth_token:ro" \
+  -v "$PWD/.sealbox-secrets/tenant_token:/run/secrets/sealbox_tenant_token:ro" \
   -v "$PWD/.sealbox-keys:/keys:ro" \
   -e SEALBOX_URL=http://127.0.0.1:8080 \
-  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_auth_token \
+  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_tenant_token \
   -e SEALBOX_PUBLIC_KEY_FILE=/keys/public_key.pem \
   -e SEALBOX_PRIVATE_KEY_FILE=/keys/private_key.pem \
   sealbox:local \
@@ -332,15 +359,15 @@ docker run --rm \
   --network container:sealbox \
   --user "$(id -u):$(id -g)" \
   --workdir /tmp \
-  -v "$PWD/.sealbox-secrets/auth_token:/run/secrets/sealbox_auth_token:ro" \
+  -v "$PWD/.sealbox-secrets/tenant_token:/run/secrets/sealbox_tenant_token:ro" \
   -v "$PWD/.sealbox-keys:/keys:ro" \
   -v "$PWD/backups:/backups" \
   -e SEALBOX_URL=http://127.0.0.1:8080 \
-  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_auth_token \
+  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_tenant_token \
   -e SEALBOX_PUBLIC_KEY_FILE=/keys/public_key.pem \
   -e SEALBOX_PRIVATE_KEY_FILE=/keys/private_key.pem \
   sealbox:local \
-  sealbox-cli secret export /backups/sealbox-export.tar.enc
+  sealbox-cli secret export /backups/sealbox-export.json
 ```
 
 Import decrypts the archive locally, migrates supported old archive formats, and writes each record through the normal client-side encrypted save path.
@@ -350,15 +377,15 @@ docker run --rm \
   --network container:sealbox \
   --user "$(id -u):$(id -g)" \
   --workdir /tmp \
-  -v "$PWD/.sealbox-secrets/auth_token:/run/secrets/sealbox_auth_token:ro" \
+  -v "$PWD/.sealbox-secrets/tenant_token:/run/secrets/sealbox_tenant_token:ro" \
   -v "$PWD/.sealbox-keys:/keys:ro" \
   -v "$PWD/backups:/backups:ro" \
   -e SEALBOX_URL=http://127.0.0.1:8080 \
-  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_auth_token \
+  -e SEALBOX_TOKEN_FILE=/run/secrets/sealbox_tenant_token \
   -e SEALBOX_PUBLIC_KEY_FILE=/keys/public_key.pem \
   -e SEALBOX_PRIVATE_KEY_FILE=/keys/private_key.pem \
   sealbox:local \
-  sealbox-cli secret import /backups/sealbox-export.tar.enc
+  sealbox-cli secret import /backups/sealbox-export.json
 ```
 
 Keep `.sealbox-keys/private_key.pem` and exported archives protected. Any process with the bearer token and matching private key can retrieve plaintext secrets.
@@ -368,7 +395,7 @@ Keep `.sealbox-keys/private_key.pem` and exported archives protected. Any proces
 2. Install dependencies: `pnpm install`
 3. Start the development server: `pnpm run dev`
 4. Open http://localhost:3000 in your browser
-5. Enter your server URL and AUTH_TOKEN to login
+5. Enter your server URL and a **tenant token** to log in (the root `AUTH_TOKEN` is rejected)
 6. Manage secrets through the intuitive web interface
    - Secret creation remains CLI-first because browser-side encryption is not implemented
 
@@ -394,7 +421,7 @@ Configure the server using environment variables:
 | `AUTH_TOKEN` | Static bearer token for API authentication | `your-secret-token` |
 | `AUTH_TOKEN_FILE` | File containing the bearer token, useful for Docker secrets | `/run/secrets/sealbox_auth_token` |
 | `LISTEN_ADDR` | Server listen address and port | `127.0.0.1:8080` |
-| `LEGACY_V1_ENABLED` | Expose the root-token v1 compatibility routes | `true` |
+| `LEGACY_V1_ENABLED` | Re-enable the **deprecated** root-token v1 API (default `false`; removed after 2026-11-25) | `false` |
 
 ### CLI Configuration
 
@@ -415,10 +442,12 @@ Sealbox implements client-side envelope encryption for CLI writes and reads:
 
 **Important**: Sealbox is intended as a lightweight local credentials store. If the same Docker runtime has the bearer token and private key, that runtime can retrieve secrets.
 
-For v2, set `SEALBOX_API_VERSION=v2` and use a tenant token with that tenant's
-matching key pair. The root token is accepted only by `/v2/admin/*` and legacy
-v1 routes; it is rejected by v2 tenant data routes. Set
-`LEGACY_V1_ENABLED=false` after all v1 clients have migrated.
+Data access uses the v2 API with a tenant token and that tenant's matching key
+pair. The root token is accepted only by `/v2/admin/*`; it is rejected by v2
+tenant data routes. The v1 API is deprecated, disabled by default, and will be
+removed after 2026-11-25. See
+[Migrating from v1](docs/cli-reference.md#migrating-from-v1) if you still have
+v1 clients or pre-tenant data.
 
 Before the first tenant-schema migration of a populated database, startup writes
 `<STORE_PATH>.pre-tenant-v2.bak` using SQLite's consistent backup path and
@@ -455,7 +484,7 @@ Exported archives are encrypted locally: the CLI builds a tar payload in memory,
 
 ## API Reference
 
-### Tenant Administration (v2 root token)
+### Tenant Administration (root token)
 
 ```text
 POST   /v2/admin/tenants
@@ -466,22 +495,23 @@ POST   /v2/admin/tenants/:tenant_id/resume
 POST   /v2/admin/tenants/:tenant_id/tokens
 GET    /v2/admin/tenants/:tenant_id/tokens
 DELETE /v2/admin/tenants/:tenant_id/tokens/:token_id
+GET    /v2/admin/backup                  # consistent SQLite snapshot of the whole store
+DELETE /v2/admin/cleanup-expired         # expired secrets in every tenant
 ```
 
-Secret and master-key routes under `/v2` mirror the v1 paths but derive tenant
-scope exclusively from the bearer token. A tenant id in a request path, query,
-or body cannot select another tenant.
-
-All endpoints require `Authorization: Bearer <token>` header.
+Tenant data routes below derive tenant scope exclusively from the bearer
+token. A tenant id in a request path, query, or body cannot select another
+tenant. They require `Authorization: Bearer <tenant token>`; the root token is
+rejected.
 
 ### Secrets Management
 ```bash
 # List all secrets with metadata
-GET /v1/secrets
+GET /v2/secrets
 # Returns: {"secrets": [{"key": "...", "version": 1, "created_at": ..., "updated_at": ..., "expires_at": ...}]}
 
 # Store a secret
-PUT /v1/secrets/:key
+PUT /v2/secrets/:key
 Content-Type: application/json
 { 
   "encrypted_data": [1, 2, 3],
@@ -491,50 +521,61 @@ Content-Type: application/json
 }
 
 # Retrieve a secret (latest version, automatically checks expiration)
-GET /v1/secrets/:key
+GET /v2/secrets/:key
 
 # Retrieve specific version
-GET /v1/secrets/:key?version=1
+GET /v2/secrets/:key?version=1
 
 # List retained version metadata
-GET /v1/secrets/:key/history
+GET /v2/secrets/:key/history
 
 # Delete a secret and all versions
-DELETE /v1/secrets/:key
+DELETE /v2/secrets/:key
 
 # Delete a specific secret version
-DELETE /v1/secrets/:key?version=1
+DELETE /v2/secrets/:key?version=1
+
+# Remove this tenant's expired secrets
+DELETE /v2/cleanup-expired
+# Returns: {"deleted_count": 15, "cleaned_at": 1640995200}
 ```
 
 ### TTL Behavior
 - **TTL**: Time-to-live in seconds from creation time
 - **Lazy Cleanup**: Expired secrets are deleted when accessed, not immediately when they expire
 - **Startup Cleanup**: Server removes expired secrets on startup
-- **Manual Cleanup**: Use admin endpoint to batch-remove expired secrets
+- **Manual Cleanup**: `DELETE /v2/cleanup-expired` (one tenant) or `DELETE /v2/admin/cleanup-expired` (all tenants, root token)
 
 ### Key Management
 ```bash
 # Register public key
-POST /v1/master-key
+POST /v2/master-key
 Content-Type: application/json
-{ "public_key": "-----BEGIN PUBLIC KEY-----..." }
+{ "public_key": "-----BEGIN RSA PUBLIC KEY-----..." }
 
 # List public keys
-GET /v1/master-key
+GET /v2/master-key
 # Returns: {"master_keys": [...]}
 
 # Fetch active public key for client-side encryption
-GET /v1/master-key/active
+GET /v2/master-key/active
 
 # Fetch a specific public key
-GET /v1/master-key/by-id/:id
+GET /v2/master-key/by-id/:id
 
 # Fetch encrypted records for client-side data-key rewrap
-GET /v1/master-key/by-id/:id/secrets
+GET /v2/master-key/by-id/:id/secrets
 
 # Rotate keys with client-side rewrapped data keys
-PUT /v1/master-key
+PUT /v2/master-key
 ```
+
+### Deprecated v1 API
+
+`/v1/...` mirrors the tenant data routes above, but authenticates with the root
+token and always reads and writes the `legacy` tenant. It is disabled unless
+`LEGACY_V1_ENABLED=true`, sends `Deprecation` and `Sunset` headers, and will be
+removed after **2026-11-25**.
 
 ### Health Check Endpoints
 ```bash
@@ -546,18 +587,6 @@ GET /healthz/live
 GET /healthz/ready
 # Returns: {"result": "Ok", "timestamp": 1640995200} if ready
 # Returns: 503 status with error details if not ready
-```
-
-### Administration
-```bash
-# Manually clean up all expired secrets
-DELETE /v1/admin/cleanup-expired
-
-# Response:
-{
-  "deleted_count": 15,
-  "cleaned_at": 1640995200
-}
 ```
 
 ## Development

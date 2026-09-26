@@ -11,7 +11,7 @@ The Sealbox server is configured entirely through environment variables.
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `STORE_PATH` | Path to SQLite database file | `/var/lib/sealbox/sealbox.db` |
-| `AUTH_TOKEN` | Static bearer token for API authentication | `your-secure-token-123` |
+| `AUTH_TOKEN` | Root bearer token for tenant administration (`/v2/admin/*`); not accepted for secret data | `your-secure-token-123` |
 | `AUTH_TOKEN_FILE` | File containing the bearer token, useful for Docker secrets | `/run/secrets/sealbox_auth_token` |
 | `LISTEN_ADDR` | Server listen address and port | `127.0.0.1:8080` |
 
@@ -20,7 +20,7 @@ The Sealbox server is configured entirely through environment variables.
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
 | `RUST_LOG` | Logging level | `info` | `debug`, `warn`, `error` |
-| `LEGACY_V1_ENABLED` | Enable root-token v1 compatibility routes | `true` | `false` for v2-only deployments |
+| `LEGACY_V1_ENABLED` | Re-enable the deprecated root-token v1 API (removed after 2026-11-25) | `false` | Leave unset |
 
 ### Example Server Configuration
 
@@ -36,7 +36,6 @@ export LISTEN_ADDR="0.0.0.0:8080"
 
 # Optional settings
 export RUST_LOG="info"
-export LEGACY_V1_ENABLED="false"  # Recommended after v1 migration
 
 # Create data directory
 mkdir -p "$(dirname "$STORE_PATH")"
@@ -59,6 +58,34 @@ On the first startup that migrates populated v1 data, Sealbox creates
 `sealbox.db.pre-tenant-v2.bak` before the transaction. Migration fails closed on
 orphaned key references. Keep the backup until v2 clients and tenant data have
 been validated.
+
+### Backup and Restore
+
+A snapshot of the SQLite store captures every tenant, key, and secret version.
+Secret values stay envelope-encrypted inside it, so reading them after a
+restore needs the same private keys as before. Back those up separately with
+`sealbox-cli key export`.
+
+```bash
+# On the server host; safe while the server is running
+sealbox-server backup --out /backups/sealbox-$(date +%F).db
+
+# Remotely, with the root token
+sealbox-cli admin backup --file backups/sealbox.db
+
+# Restore: stop the server first
+systemctl stop sealbox
+sealbox-server restore --from /backups/sealbox-2026-09-26.db --force
+systemctl start sealbox
+```
+
+Both backup paths use SQLite `VACUUM INTO` for a consistent point-in-time copy
+and run `PRAGMA integrity_check` on the result. `restore` verifies the snapshot
+before touching anything. It moves the current database and its `-wal`/`-shm`
+files to `<STORE_PATH>.pre-restore-<unix-time>.bak` rather than deleting them.
+Snapshots include tenant metadata and token hashes, so store them like the
+root token. `GET /v2/admin/backup` buffers the snapshot in memory, which suits
+Sealbox's small-store design.
 
 ### Systemd Service Example
 
@@ -124,7 +151,7 @@ Use the `config init` command to create your configuration file:
 # Initialize with command-line parameters
 sealbox-cli config init \
     --url http://localhost:8080 \
-    --token your-secure-token \
+    --token "$(cat ~/.config/sealbox/tenant_token)" \
     --public-key ~/.config/sealbox/public_key.pem \
     --private-key ~/.config/sealbox/private_key.pem \
     --output table
@@ -171,8 +198,9 @@ CLI configuration can be overridden with environment variables:
 | Environment Variable | Config Option | Example |
 |---------------------|---------------|---------|
 | `SEALBOX_URL` | `server.url` | `http://localhost:8080` |
-| `SEALBOX_TOKEN` | `server.token` | `your-auth-token` |
-| `SEALBOX_TOKEN_FILE` | `server.token` read from file | `/run/secrets/sealbox_auth_token` |
+| `SEALBOX_TOKEN` | `server.token` (a tenant token) | `sbx_t_...` |
+| `SEALBOX_TOKEN_FILE` | `server.token` read from file | `/run/secrets/tenant_token` |
+| `SEALBOX_API_VERSION` | `server.api_version` | `v2` (default; `v1` is deprecated) |
 | `SEALBOX_OUTPUT_FORMAT` | `output.format` | `json` |
 | `SEALBOX_PRIVATE_KEY` | `keys.private_key_path` | `/path/to/private.pem` |
 | `SEALBOX_PUBLIC_KEY` | `keys.public_key_path` | `/path/to/public.pem` |
@@ -303,7 +331,7 @@ env | grep -E "(STORE_PATH|AUTH_TOKEN|LISTEN_ADDR)"
 sealbox-cli config show
 
 # Test server connectivity
-curl -H "Authorization: Bearer $SEALBOX_TOKEN" $SEALBOX_URL/v1/master-key
+curl -H "Authorization: Bearer $SEALBOX_TOKEN" $SEALBOX_URL/v2/master-key
 
 # Verify key files exist and are readable
 ls -la ~/.config/sealbox/*.pem
@@ -312,11 +340,10 @@ The server token is the root administration credential. Tenant data access uses
 separately issued tenant tokens against `/v2`; the server stores only token
 hashes. Root and tenant credentials are intentionally not interchangeable.
 
-For a v2 tenant client, configure:
+For a tenant client, configure:
 
 ```bash
 export SEALBOX_URL=https://sealbox.internal
-export SEALBOX_API_VERSION=v2
 export SEALBOX_TOKEN_FILE=/run/secrets/tenant_token
 export SEALBOX_PUBLIC_KEY_FILE=/run/secrets/tenant_public.pem
 export SEALBOX_PRIVATE_KEY_FILE=/run/secrets/tenant_private.pem

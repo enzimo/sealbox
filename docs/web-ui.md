@@ -53,9 +53,10 @@ open http://localhost:3000
 
 1. **Start sealbox-server** with CORS enabled (automatic in debug mode)
 2. **Access Web UI** at http://localhost:3000
-3. **Login** with your server URL and AUTH_TOKEN:
+3. **Login** with your server URL and a tenant token:
    - Server URL: `http://localhost:8080`
-   - Token: Your `AUTH_TOKEN` environment variable value
+   - Token: A tenant API token (`sbx_t_...`) from `sealbox-cli tenant create` or `tenant token create`. The server's root `AUTH_TOKEN` is rejected.
+   - Login checks the token against `GET /v2/master-key`, so a wrong token fails at login instead of on the first page
 4. **Choose your language** - Interface available in English, Chinese, Japanese, and German
 
 ## Project Structure
@@ -157,15 +158,16 @@ pnpm run preview
 
 ## API Integration
 
-The Web UI integrates with all sealbox-server APIs:
+The Web UI uses the tenant-scoped v2 API:
 
-- `GET /v1/secrets` - List secrets
-- `GET /v1/secrets/:key` - Get secret details
-- `GET /v1/secrets/:key/history` - List retained version metadata
-- `DELETE /v1/secrets/:key` - Delete secret and all versions
-- `GET /v1/master-key` - List master keys
-- `GET /v1/master-key/active` - Fetch active public key metadata
-- `POST /v1/master-key` - Register master key
+- `GET /v2/secrets` - List secrets
+- `GET /v2/secrets/:key` - Get secret details
+- `GET /v2/secrets/:key/history` - List retained version metadata
+- `DELETE /v2/secrets/:key` - Delete secret and all versions
+- `GET /v2/master-key` - List master keys (also used to verify the token at login)
+- `GET /v2/master-key/active` - Fetch active public key metadata
+- `POST /v2/master-key` - Register master key
+- `DELETE /v2/cleanup-expired` - Remove this tenant's expired secrets
 
 ### Error Handling
 

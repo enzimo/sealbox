@@ -3,7 +3,7 @@ use rsa::{
     pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey, EncodeRsaPrivateKey, EncodeRsaPublicKey},
     pkcs8::LineEnding,
 };
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -70,6 +70,14 @@ impl PrivateMasterKey {
             .decrypt(padding, ciphertext)
             .map_err(MasterKeyCryptoError::FailedToDecrypt)?;
         Ok(decrypted)
+    }
+
+    /// Derive the matching public key.
+    ///
+    /// An RSA private key carries its public modulus and exponent, so a backup
+    /// that only kept the private key can always recover the public half.
+    pub fn public_key(&self) -> PublicMasterKey {
+        PublicMasterKey(RsaPublicKey::from(&self.0))
     }
 }
 
@@ -138,6 +146,28 @@ impl PublicMasterKey {
             .map_err(MasterKeyCryptoError::FailedToEncrypt)?;
         Ok(encrypted)
     }
+
+    /// Export the public key in PKCS#1 PEM format.
+    pub fn to_pem(&self) -> Result<String> {
+        self.0
+            .to_pkcs1_pem(LineEnding::LF)
+            .map_err(MasterKeyCryptoError::FailedToExportPemFormat)
+    }
+
+    /// Stable identifier for a key pair: `sha256:` followed by the hex SHA-256
+    /// digest of the PKCS#1 DER public key.
+    ///
+    /// Hashing the DER encoding rather than the PEM text keeps the fingerprint
+    /// independent of line endings and whitespace in key files.
+    pub fn fingerprint(&self) -> Result<String> {
+        let der = self
+            .0
+            .to_pkcs1_der()
+            .map_err(MasterKeyCryptoError::FailedToExportPemFormat)?;
+        let digest = Sha256::digest(der.as_bytes());
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(format!("sha256:{hex}"))
+    }
 }
 
 impl std::str::FromStr for PublicMasterKey {
@@ -192,6 +222,7 @@ pub fn generate_key_pair() -> Result<(String, String), MasterKeyCryptoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_generate_key_pair() {
@@ -439,5 +470,31 @@ mod tests {
         // Keys should be different
         assert_ne!(private_pem1, private_pem2);
         assert_ne!(public_pem1, public_pem2);
+    }
+
+    #[test]
+    fn test_public_key_derived_from_private_matches_generated_pair() {
+        let (private_pem, public_pem) = generate_key_pair().unwrap();
+        let private_key = PrivateMasterKey::from_str(&private_pem).unwrap();
+
+        let derived = private_key.public_key();
+
+        assert_eq!(derived.to_pem().unwrap(), public_pem);
+    }
+
+    #[test]
+    fn test_fingerprint_is_stable_and_distinguishes_keys() {
+        let (_, public_pem) = generate_key_pair().unwrap();
+        let (_, other_public_pem) = generate_key_pair().unwrap();
+        let public_key = PublicMasterKey::from_str(&public_pem).unwrap();
+        let reparsed = PublicMasterKey::from_str(&public_pem.replace('\n', "\r\n")).unwrap();
+        let other = PublicMasterKey::from_str(&other_public_pem).unwrap();
+
+        let fingerprint = public_key.fingerprint().unwrap();
+
+        assert!(fingerprint.starts_with("sha256:"));
+        assert_eq!(fingerprint.len(), "sha256:".len() + 64);
+        assert_eq!(fingerprint, reparsed.fingerprint().unwrap());
+        assert_ne!(fingerprint, other.fingerprint().unwrap());
     }
 }

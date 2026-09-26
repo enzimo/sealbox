@@ -1,5 +1,7 @@
 {
   "nav": {
+    "secrets": "Secrets",
+    "keys": "Master Keys",
     "signOut": "Sign out"
   },
   "login": {
@@ -7,20 +9,20 @@
     "subtitle": "Connect to your secret management server",
     "serverUrl": "Server URL",
     "serverUrlPlaceholder": "http://localhost:8080",
-    "token": "Authentication Token",
-    "tokenPlaceholder": "Enter your Bearer Token",
+    "token": "Tenant API Token",
+    "tokenPlaceholder": "Enter your tenant token (sbx_t_…)",
     "connect": "Connect",
     "connecting": "Connecting...",
     "firstTime": "First time using?",
     "steps": {
       "start": "Start sealbox-server",
-      "setToken": "Set AUTH_TOKEN environment variable",
+      "setToken": "Create a tenant token with 'sealbox-cli tenant create'",
       "enterDetails": "Enter server URL and token above"
     },
     "errors": {
       "invalidUrl": "Please enter a valid server URL",
       "tokenRequired": "Please enter authentication token",
-      "authFailed": "Authentication failed, please check your token",
+      "authFailed": "Authentication failed. Use a tenant token, not the server AUTH_TOKEN",
       "authError": "Authentication error: {{message}}",
       "connectionFailed": "Unable to connect to server, please check the URL",
       "connectionError": "Connection error: {{message}}"

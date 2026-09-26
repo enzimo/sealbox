@@ -52,11 +52,34 @@ pub async fn handle_command(command: SecretCommands, config: &Config) -> Result<
         }
         SecretCommands::List => list_secrets(config, &output).await,
         SecretCommands::History { key } => get_secret_history(config, &output, key).await,
-        SecretCommands::Import { file, format } => {
-            secret_archive::import_secrets(config, &output, file, format).await
-        }
-        SecretCommands::Export { file, keys, format } => {
-            secret_archive::export_secrets(config, &output, file, keys, format).await
+        SecretCommands::Import {
+            file,
+            format,
+            passphrase_file,
+        } => secret_archive::import_secrets(config, &output, file, format, passphrase_file).await,
+        SecretCommands::Export {
+            file,
+            keys,
+            format,
+            all_versions,
+            passphrase,
+            passphrase_file,
+            force,
+        } => {
+            secret_archive::export_secrets(
+                config,
+                &output,
+                secret_archive::ExportOptions {
+                    file,
+                    keys_pattern: keys,
+                    format,
+                    all_versions,
+                    passphrase,
+                    passphrase_file,
+                    force,
+                },
+            )
+            .await
         }
     }
 }
@@ -89,7 +112,7 @@ async fn set_secret(
     save_secret_value(config, output, key, secret_value, ttl, None).await
 }
 
-async fn fetch_active_master_key(config: &Config) -> Result<MasterKey> {
+pub(crate) async fn fetch_active_master_key(config: &Config) -> Result<MasterKey> {
     let client = Client::new();
     let response = client
         .get(config.api_url("master-key/active"))
@@ -189,7 +212,7 @@ pub async fn save_secret_bytes(
 ///
 /// Callers that store large payloads (such as files) should summarize the
 /// response instead of printing it, because it echoes the ciphertext.
-async fn encrypt_and_store(
+pub(crate) async fn encrypt_and_store(
     config: &Config,
     output: &OutputManager,
     key: String,
@@ -538,7 +561,7 @@ mod tests {
 
         let url = secret_key_url(&config, "db/postgres");
 
-        assert_eq!(url, "http://localhost:8080/v1/secrets/db%2Fpostgres");
+        assert_eq!(url, "http://localhost:8080/v2/secrets/db%2Fpostgres");
     }
 
     #[tokio::test]

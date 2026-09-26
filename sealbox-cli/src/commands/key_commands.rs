@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 use crate::{KeyCommands, config::Config, output::OutputManager};
 
+use super::key_backup;
+
 pub async fn handle_command(command: KeyCommands, config: &Config) -> Result<()> {
     let output = OutputManager::new(config.output.format.clone());
 
@@ -28,6 +30,29 @@ pub async fn handle_command(command: KeyCommands, config: &Config) -> Result<()>
             old_key_id,
         } => rotate_keys(config, &output, new_key_id, old_key_id).await,
         KeyCommands::Status => check_key_status(config, &output).await,
+        KeyCommands::Export {
+            file,
+            passphrase_file,
+            force,
+        } => key_backup::export_keys(config, &output, file, passphrase_file, force).await,
+        KeyCommands::Import {
+            file,
+            passphrase_file,
+            public_key_path,
+            private_key_path,
+            force,
+        } => {
+            key_backup::import_keys(
+                config,
+                &output,
+                file,
+                passphrase_file,
+                public_key_path,
+                private_key_path,
+                force,
+            )
+            .await
+        }
     }
 }
 
@@ -414,6 +439,10 @@ async fn check_key_status(config: &Config, output: &OutputManager) -> Result<()>
                         ),
                     ) {
                         (Ok(public_key), Ok(private_key)) => {
+                            if let Ok(fingerprint) = public_key.fingerprint() {
+                                status_info["local_keys"]["public_key_fingerprint"] =
+                                    json!(fingerprint);
+                            }
                             // Test key pair compatibility by encrypting and decrypting a test message
                             match public_key.encrypt(b"test") {
                                 Ok(encrypted) => match private_key.decrypt(&encrypted) {

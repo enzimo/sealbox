@@ -49,13 +49,22 @@ Database: /var/lib/sealbox/sealbox.db
 
 ## Step 3: Set Up the CLI
 
-Initialize the CLI configuration with command-line parameters:
+`AUTH_TOKEN` is the server's root credential. It creates tenants but cannot
+read or write secrets. Create a tenant first; its API token is written once to
+a mode-`0600` file:
+
+```bash
+./target/release/sealbox-cli --url http://localhost:8080 --token your-secure-token-here \
+    tenant create --display-name "Personal" --token-file ~/.config/sealbox/tenant_token
+```
+
+Then initialize the CLI with the **tenant** token:
 
 ```bash
 # Initialize with all parameters (recommended)
 ./target/release/sealbox-cli config init \
     --url http://localhost:8080 \
-    --token your-secure-token-here \
+    --token "$(cat ~/.config/sealbox/tenant_token)" \
     --public-key ~/.config/sealbox/public_key.pem \
     --private-key ~/.config/sealbox/private_key.pem \
     --output table
@@ -133,11 +142,55 @@ printf '%s\n' "db-password" | ./target/release/sealbox-cli credential set db/pos
 ./target/release/sealbox-cli credential list --query postgres
 
 # Export a versioned encrypted archive
-./target/release/sealbox-cli secret export backups/sealbox-export.tar.enc
+./target/release/sealbox-cli secret export backups/sealbox-export.json
 
 # Import an encrypted archive into the current server
-./target/release/sealbox-cli secret import backups/sealbox-export.tar.enc
+./target/release/sealbox-cli secret import backups/sealbox-export.json
 ```
+
+## Backing Up and Restoring
+
+Your private key is the one thing the server cannot give back, so back it up
+first:
+
+```bash
+# 1. Passphrase-encrypted copy of your key pair
+./target/release/sealbox-cli key export --file backups/sealbox-keys.bundle
+
+# 2. Every secret version, readable with only the passphrase
+./target/release/sealbox-cli secret export backups/secrets.json --all-versions --passphrase
+```
+
+**Restore onto a new server that already has its own key pair.** The new
+server's config points at its fresh, registered key. You have a public-key
+archive made with `secret export backups/secrets-rsa.json` and the original
+private key file:
+
+```bash
+./target/release/sealbox-cli secret import backups/secrets-rsa.json \
+  --private-key /path/to/original_private_key.pem
+```
+
+The archive is opened with the original key and every secret is re-encrypted
+to the new server's active key. Afterwards the configured key reads them. If
+you pass the wrong key, the import stops and prints both fingerprints.
+
+**Restore with only the passphrase.** For a passphrase archive, no private key
+is needed to open it:
+
+```bash
+./target/release/sealbox-cli secret import backups/secrets.json
+```
+
+**Get your old key pair back** (for example, to read a server snapshot):
+
+```bash
+./target/release/sealbox-cli key import --file backups/sealbox-keys.bundle
+./target/release/sealbox-cli key register   # only needed on a server that has never seen this key
+```
+
+Operators can also snapshot the entire server database. See
+[Backup and Restore](configuration.md#backup-and-restore).
 
 ## Understanding the Security Model
 
@@ -203,7 +256,8 @@ Sealbox supports automatic expiration of secrets using TTL:
 
 ### CLI can't connect to server
 - **Network Proxy Issues**: If you're using Surge, ClashX, or other proxy software, disable it for localhost connections or add localhost to bypass list
-- Verify the server is running: `curl -H "Authorization: Bearer your-token" http://localhost:8080/v1/master-key`
+- Verify the server is running: `curl -H "Authorization: Bearer your-tenant-token" http://localhost:8080/v2/master-key`
+- A `401` on secret or key commands usually means the root `AUTH_TOKEN` is configured instead of a tenant token
 - Check the URL and token in your configuration: `./target/release/sealbox-cli config show`
 
 ### Configuration Issues
@@ -214,4 +268,4 @@ Sealbox supports automatic expiration of secrets using TTL:
 ### TTL-Related Issues
 - **Secret disappeared**: It may have expired, check if you set a TTL
 - **Unexpected cleanup**: Server cleans expired secrets on startup
-- **Storage not shrinking**: Use manual cleanup: `curl -X DELETE -H "Authorization: Bearer $TOKEN" $URL/v1/admin/cleanup-expired`
+- **Storage not shrinking**: Use manual cleanup: `curl -X DELETE -H "Authorization: Bearer $TENANT_TOKEN" $URL/v2/cleanup-expired`

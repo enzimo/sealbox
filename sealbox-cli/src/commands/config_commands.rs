@@ -178,7 +178,7 @@ async fn init_config(
 
         // Ask for authentication token only if not provided
         if options.token.is_none() {
-            println!("Enter authentication token: ");
+            println!("Enter tenant API token (sbx_t_...): ");
             let token_input = rpassword::read_password()?;
             if !token_input.is_empty() {
                 config.server.token = token_input;

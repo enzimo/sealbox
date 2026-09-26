@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Alert } from "@/components/ui/alert";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { LanguageSelector } from "@/components/i18n/language-selector";
 import { ThemeToggle } from "@/components/theme/theme-toggle";
 import { useAuthStore } from "@/stores/auth";
@@ -59,9 +59,10 @@ function LoginPage() {
 
   const onSubmit = async (data: LoginForm) => {
     try {
-      // Test connection - use readiness endpoint to verify server status and authentication
+      // Readiness needs no auth, so also call a tenant route to verify the token
       const api = createApiClient(data.serverUrl, data.token);
       await api.readiness();
+      await api.listMasterKeys();
 
       // Connection successful, save authentication info
       login(data.token, data.serverUrl);
@@ -129,7 +130,7 @@ function LoginPage() {
             />
             {errors.serverUrl && (
               <Alert variant="destructive" className="py-2 text-sm">
-                {errors.serverUrl.message}
+                <AlertDescription>{errors.serverUrl.message}</AlertDescription>
               </Alert>
             )}
           </div>
@@ -146,7 +147,7 @@ function LoginPage() {
             />
             {errors.token && (
               <Alert variant="destructive" className="py-2 text-sm">
-                {errors.token.message}
+                <AlertDescription>{errors.token.message}</AlertDescription>
               </Alert>
             )}
           </div>

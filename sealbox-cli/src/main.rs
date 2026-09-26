@@ -3,10 +3,10 @@ mod config;
 mod output;
 
 use crate::commands::{
-    config_commands, credential_commands, file_commands, key_commands, password_commands,
-    secret_commands, tenant_commands,
+    admin_commands, config_commands, credential_commands, file_commands, key_commands,
+    password_commands, secret_commands, tenant_commands,
 };
-use crate::config::{Config, OutputFormat, normalize_api_version};
+use crate::config::{Config, LEGACY_V1_WARNING, OutputFormat, normalize_api_version};
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
@@ -30,7 +30,7 @@ struct Cli {
     #[arg(long, global = true)]
     token: Option<String>,
 
-    /// API version for secret/key operations (v1 or v2)
+    /// API version for secret/key operations: v2 (default) or the deprecated v1
     #[arg(long, global = true)]
     api_version: Option<String>,
 
@@ -38,7 +38,8 @@ struct Cli {
     #[arg(long, global = true)]
     public_key: Option<String>,
 
-    /// Private key file path
+    /// Private key file path. For `secret import`, this is the key the archive
+    /// was exported with, which may differ from the target server's key
     #[arg(long, global = true)]
     private_key: Option<String>,
 
@@ -100,6 +101,24 @@ enum Commands {
     Tenant {
         #[command(subcommand)]
         command: TenantCommands,
+    },
+    /// Server-wide operator tasks (require the root token)
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AdminCommands {
+    /// Download a consistent snapshot of the whole server database
+    Backup {
+        /// Destination file for the SQLite snapshot
+        #[arg(long)]
+        file: String,
+        /// Overwrite the destination file if it already exists
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -166,6 +185,36 @@ enum KeyCommands {
     },
     /// Check key status
     Status,
+    /// Back up the local key pair to a passphrase-encrypted bundle
+    Export {
+        /// Destination bundle file
+        #[arg(long)]
+        file: String,
+        /// Read the passphrase from this file instead of prompting
+        #[arg(long)]
+        passphrase_file: Option<String>,
+        /// Overwrite the destination file if it already exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Restore a key pair from a passphrase-encrypted bundle
+    Import {
+        /// Bundle file created by 'key export'
+        #[arg(long)]
+        file: String,
+        /// Read the passphrase from this file instead of prompting
+        #[arg(long)]
+        passphrase_file: Option<String>,
+        /// Where to write the public key (defaults to the configured path)
+        #[arg(long)]
+        public_key_path: Option<String>,
+        /// Where to write the private key (defaults to the configured path)
+        #[arg(long)]
+        private_key_path: Option<String>,
+        /// Overwrite existing key files
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,12 +253,19 @@ enum SecretCommands {
         key: String,
     },
     /// Import secrets from an encrypted Sealbox archive
+    ///
+    /// Key-protected archives are decrypted with the private key they were
+    /// exported for; pass it with --private-key if it is not the configured
+    /// key. Imported secrets are re-encrypted to the server's active key.
     Import {
         /// Encrypted archive file path
         file: String,
         /// File format
         #[arg(long, default_value = "encrypted-tar")]
         format: String,
+        /// For passphrase-protected archives: read the passphrase from this file
+        #[arg(long)]
+        passphrase_file: Option<String>,
     },
     /// Export secrets to an encrypted Sealbox archive
     Export {
@@ -221,6 +277,19 @@ enum SecretCommands {
         /// File format
         #[arg(long, default_value = "encrypted-tar")]
         format: String,
+        /// Include every retained version, not just the latest
+        #[arg(long)]
+        all_versions: bool,
+        /// Protect the archive with a passphrase instead of the public key,
+        /// so it can be restored without the private key
+        #[arg(long)]
+        passphrase: bool,
+        /// Read the passphrase from this file (implies --passphrase)
+        #[arg(long)]
+        passphrase_file: Option<String>,
+        /// Overwrite the archive file if it already exists
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -433,6 +502,18 @@ async fn main() -> Result<()> {
         config.output.format = output.into();
     }
 
+    // Only data commands go through `api_version`; admin/tenant always use v2.
+    let uses_data_api = matches!(
+        cli.command,
+        Commands::Key { .. }
+            | Commands::Secret { .. }
+            | Commands::Credential { .. }
+            | Commands::File { .. }
+    );
+    if uses_data_api && config.server.api_version == "v1" {
+        eprintln!("⚠️  {LEGACY_V1_WARNING}");
+    }
+
     // Execute command
     match cli.command {
         Commands::Config { command } => config_commands::handle_command(command, &mut config).await,
@@ -444,6 +525,7 @@ async fn main() -> Result<()> {
         Commands::File { command } => file_commands::handle_command(command, &config).await,
         Commands::Password { command } => password_commands::handle_command(command, &config).await,
         Commands::Tenant { command } => tenant_commands::handle_command(command, &config).await,
+        Commands::Admin { command } => admin_commands::handle_command(command, &config).await,
     }
 }
 
@@ -741,5 +823,131 @@ mod tests {
             }
             _ => panic!("Expected file delete command"),
         }
+    }
+
+    #[test]
+    fn test_parse_secret_import_accepts_private_key_after_subcommand() {
+        let cli = Cli::try_parse_from([
+            "sealbox",
+            "secret",
+            "import",
+            "backup.sealbox",
+            "--private-key",
+            "/backup/original_private_key.pem",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.private_key.as_deref(),
+            Some("/backup/original_private_key.pem")
+        );
+        match cli.command {
+            Commands::Secret {
+                command:
+                    SecretCommands::Import {
+                        file,
+                        passphrase_file,
+                        ..
+                    },
+            } => {
+                assert_eq!(file, "backup.sealbox");
+                assert!(passphrase_file.is_none());
+            }
+            _ => panic!("Expected secret import command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_secret_export_backup_options() {
+        let cli = Cli::try_parse_from([
+            "sealbox",
+            "secret",
+            "export",
+            "backup.sealbox",
+            "--all-versions",
+            "--passphrase-file",
+            "/run/secrets/backup-passphrase",
+            "--force",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Secret {
+                command:
+                    SecretCommands::Export {
+                        all_versions,
+                        passphrase,
+                        passphrase_file,
+                        force,
+                        ..
+                    },
+            } => {
+                assert!(all_versions);
+                assert!(!passphrase);
+                assert_eq!(
+                    passphrase_file.as_deref(),
+                    Some("/run/secrets/backup-passphrase")
+                );
+                assert!(force);
+            }
+            _ => panic!("Expected secret export command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_key_import_with_target_paths() {
+        let cli = Cli::try_parse_from([
+            "sealbox",
+            "key",
+            "import",
+            "--file",
+            "keys.bundle",
+            "--private-key-path",
+            "/keys/private.pem",
+            "--public-key-path",
+            "/keys/public.pem",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Key {
+                command:
+                    KeyCommands::Import {
+                        file,
+                        private_key_path,
+                        public_key_path,
+                        force,
+                        ..
+                    },
+            } => {
+                assert_eq!(file, "keys.bundle");
+                assert_eq!(private_key_path.as_deref(), Some("/keys/private.pem"));
+                assert_eq!(public_key_path.as_deref(), Some("/keys/public.pem"));
+                assert!(!force);
+            }
+            _ => panic!("Expected key import command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_admin_backup() {
+        let cli =
+            Cli::try_parse_from(["sealbox", "admin", "backup", "--file", "sealbox.db"]).unwrap();
+
+        match cli.command {
+            Commands::Admin {
+                command: AdminCommands::Backup { file, force },
+            } => {
+                assert_eq!(file, "sealbox.db");
+                assert!(!force);
+            }
+            _ => panic!("Expected admin backup command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_definition_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
     }
 }

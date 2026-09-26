@@ -1,8 +1,8 @@
 use axum::{
     Router,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderName, Request},
-    middleware::from_fn_with_state,
+    http::{HeaderName, HeaderValue, Request},
+    middleware::{from_fn_with_state, map_response},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -23,7 +23,7 @@ use crate::{
         handler::{admin, master_key, secret, tenant},
         state::AppState,
     },
-    config::SealboxConfig,
+    config::{LEGACY_V1_REMOVAL_DATE, LEGACY_V1_SUNSET_HTTP_DATE, SealboxConfig},
     error::{Result, SealboxError},
     repo::MAX_SECRET_REQUEST_BYTES,
 };
@@ -77,6 +77,9 @@ pub fn create_app(config: &SealboxConfig) -> Result<Router> {
         CorsLayer::new().allow_origin([])
     };
 
+    // Deprecated v1 API: root-token access to the `legacy` tenant. Off unless
+    // LEGACY_V1_ENABLED=true. TODO(2026-11-25): delete these routes and their
+    // handlers; see `config::LEGACY_V1_REMOVAL_DATE`.
     let legacy_routes = Router::new()
         .route("/{version}/secrets", get(secret::list))
         .route(
@@ -111,7 +114,8 @@ pub fn create_app(config: &SealboxConfig) -> Result<Router> {
             "/{version}/admin/cleanup-expired",
             axum::routing::delete(admin::cleanup_expired),
         )
-        .route_layer(from_fn_with_state(state.clone(), static_auth));
+        .route_layer(from_fn_with_state(state.clone(), static_auth))
+        .layer(map_response(mark_deprecated));
 
     let tenant_routes = Router::new()
         .route("/v2/secrets", get(secret::list_v2))
@@ -131,6 +135,10 @@ pub fn create_app(config: &SealboxConfig) -> Result<Router> {
         )
         .route("/v2/master-key/active", get(master_key::active_v2))
         .route(
+            "/v2/cleanup-expired",
+            axum::routing::delete(admin::cleanup_expired_v2),
+        )
+        .route(
             "/v2/master-key/by-id/{master_key_id}",
             get(master_key::get_v2),
         )
@@ -141,6 +149,11 @@ pub fn create_app(config: &SealboxConfig) -> Result<Router> {
         .route_layer(from_fn_with_state(state.clone(), tenant_auth));
 
     let tenant_admin_routes = Router::new()
+        .route("/v2/admin/backup", get(admin::backup))
+        .route(
+            "/v2/admin/cleanup-expired",
+            axum::routing::delete(admin::cleanup_expired),
+        )
         .route("/v2/admin/tenants", get(tenant::list).post(tenant::create))
         .route("/v2/admin/tenants/{tenant_id}", get(tenant::get))
         .route(
@@ -174,6 +187,23 @@ pub fn create_app(config: &SealboxConfig) -> Result<Router> {
         .with_state(state)
         .layer(cors_layer)
         .layer(request_id_middleware))
+}
+
+/// Tag every v1 response so clients that still call it can notice (RFC 8594
+/// `Sunset`, and the `Deprecation` header).
+async fn mark_deprecated(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert("deprecation", HeaderValue::from_static("true"));
+    headers.insert(
+        "sunset",
+        HeaderValue::from_static(LEGACY_V1_SUNSET_HTTP_DATE),
+    );
+    if let Ok(warning) = HeaderValue::from_str(&format!(
+        "299 - \"Sealbox v1 API is deprecated and will be removed after {LEGACY_V1_REMOVAL_DATE}; use /v2 with a tenant token\""
+    )) {
+        headers.insert("warning", warning);
+    }
+    response
 }
 
 async fn root() -> &'static str {

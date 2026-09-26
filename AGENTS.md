@@ -26,7 +26,7 @@ Sealbox is a lightweight, single-node secret storage service built in Rust. It p
 - **Envelope encryption**: Secrets are encrypted with random data keys, data keys are encrypted with the active public key
 - **RSA + AES-GCM**: 2048-bit RSA for key encryption, AES-256-GCM for data encryption
 - **Private-key locality**: Only clients with private keys can decrypt stored secrets or rewrap data keys during rotation
-- **Tenant authorization**: v2 data routes derive an opaque tenant id only from a hashed tenant bearer token
+- **Tenant authorization**: v2 data routes (the default for server, CLI, and web UI) derive an opaque tenant id only from a hashed tenant bearer token
 - **Per-tenant keys**: Each tenant has an independent active RSA key and isolated secret/metadata namespace
 - **Root separation**: The static server token administers tenants and legacy v1 data; it is rejected by v2 tenant data routes
 - **Service independence**: Sealbox must not import or encode an upstream application's user, team, or channel model
@@ -107,10 +107,14 @@ cargo clippy --all-targets --all-features --workspace -- -D warnings
 The CLI provides comprehensive secret management by interfacing with the server's encryption system:
 
 ```bash
+# Create a tenant with the root AUTH_TOKEN; data commands use the tenant token
+./target/release/sealbox-cli --url http://localhost:8080 --token secrettoken123 \
+    tenant create --display-name "Personal" --token-file ~/.config/sealbox/tenant_token
+
 # Initialize configuration with parameters (recommended)
 ./target/release/sealbox-cli config init \
     --url http://localhost:8080 \
-    --token your-secure-token \
+    --token "$(cat ~/.config/sealbox/tenant_token)" \
     --public-key ~/.config/sealbox/public_key.pem \
     --private-key ~/.config/sealbox/private_key.pem \
     --output table
@@ -143,7 +147,8 @@ The CLI provides comprehensive secret management by interfacing with the server'
 Environment variables:
 - `STORE_PATH`: SQLite database file path
 - `LISTEN_ADDR`: Server listen address (e.g., 127.0.0.1:8080)  
-- `AUTH_TOKEN`: Static bearer token for API authentication
+- `AUTH_TOKEN`: Root bearer token for tenant administration; data access uses tenant tokens
+- `LEGACY_V1_ENABLED`: Re-enable the deprecated v1 API (default `false`; removed after 2026-11-25)
 
 ### CLI Configuration
 The CLI uses TOML configuration files with environment variable overrides:
@@ -188,22 +193,39 @@ The CLI uses TOML configuration files with environment variable overrides:
 - `GET /healthz/live` - Liveness probe for Kubernetes
 - `GET /healthz/ready` - Readiness probe with database connection check
 
-### Business Endpoints (Require `Authorization: Bearer <token>` header)
-- `GET /v1/secrets` - List all secrets with metadata (key, version, timestamps, TTL)
-- `PUT /v1/secrets/:key` - Create secret version (supports TTL via `ttl` field; rejects `encrypted_data` above 500 KB of plaintext plus AES-GCM overhead with HTTP 413)
-- `GET /v1/secrets/:key[?version=N]` - Retrieve secret (automatic expiry check)
-- `GET /v1/secrets/:key/history` - List retained version metadata
-- `DELETE /v1/secrets/:key[?version=N]` - Delete all secret versions by default, or delete one version when `version` is provided
-- `POST /v1/master-key` - Register public key
-- `GET /v1/master-key` - List public keys
-- `PUT /v1/master-key` - Rotate keys
-- `DELETE /v1/admin/cleanup-expired` - Manual cleanup of expired secrets
-- `/v2/...` mirrors secret/master-key operations with tenant-token scope
-- `/v2/admin/tenants...` provides root-only tenant and token lifecycle operations
+### Tenant Data Endpoints (Require `Authorization: Bearer <tenant token>`)
+- `GET /v2/secrets` - List all secrets with metadata (key, version, timestamps, TTL)
+- `PUT /v2/secrets/:key` - Create secret version (supports TTL via `ttl` field; rejects `encrypted_data` above 500 KB of plaintext plus AES-GCM overhead with HTTP 413)
+- `GET /v2/secrets/:key[?version=N]` - Retrieve secret (automatic expiry check)
+- `GET /v2/secrets/:key/history` - List retained version metadata
+- `DELETE /v2/secrets/:key[?version=N]` - Delete all secret versions by default, or delete one version when `version` is provided
+- `POST /v2/master-key` - Register public key
+- `GET /v2/master-key` - List public keys
+- `PUT /v2/master-key` - Rotate keys
+- `DELETE /v2/cleanup-expired` - Remove the tenant's expired secrets
+
+### Root Endpoints (Require `Authorization: Bearer <AUTH_TOKEN>`)
+- `/v2/admin/tenants...` - Tenant and token lifecycle operations
+- `GET /v2/admin/backup` - Consistent SQLite snapshot of the whole store
+- `DELETE /v2/admin/cleanup-expired` - Remove expired secrets in every tenant
+
+### v1 API removal (deprecated; delete after 2026-11-25)
+The `/v1/...` routes use the root token against the `legacy` tenant. They are off unless `LEGACY_V1_ENABLED=true`, and they send `Deprecation`/`Sunset` headers. **On or after 2026-11-25, remove them:**
+- Server: `LEGACY_V1_REMOVAL_DATE`, `LEGACY_V1_SUNSET_HTTP_DATE` and `legacy_v1_enabled` in `config.rs`; `legacy_routes` and `mark_deprecated` in `api/mod.rs`; the root-token v1 handlers (`secret::{get,save,delete,list,history}`, the non-`_v2` `master_key` handlers) and the `Version` path enum; the v1-only integration tests in `tests/multi_tenant_api.rs`
+- CLI: the `"v1"` arm of `normalize_api_version` and `LEGACY_V1_WARNING` in `config.rs`, and the warning in `main.rs`
+- Docs: `LEGACY_V1_ENABLED` rows, "Deprecated v1 API" in README.md, and "Migrating from v1" in docs/cli-reference.md
+- Keep: the `legacy` tenant and `LEGACY_TENANT_ID`. They hold pre-tenant data, which stays reachable through tenant tokens
+- Search for `TODO(2026-11-25)` to find the code markers
 
 ## Development Status
 
 ### Completed Features
+- ✅ **Backup and restore**
+  - `key export`/`key import`: key pair in an Argon2id + AES-256-GCM passphrase bundle
+  - `secret export --all-versions` and `--passphrase`: full history, and archives that do not need the RSA key
+  - Archive envelope v2 records the public key fingerprint; `secret import --private-key <old.pem>` restores onto a server with a different active key, and a wrong key is rejected with both fingerprints
+  - Archive format v2 stores base64 values, so binary files round-trip (v1 archives still import)
+  - `sealbox-server backup|restore` and `sealbox-cli admin backup` (`GET /v2/admin/backup`) for whole-database snapshots
 - ✅ **Encrypted file storage** - Store small files (up to 500 KB) alongside secrets
   - **Same envelope encryption** as passwords and tokens: files are encrypted client-side with a random data key that is wrapped by the active RSA public key
   - **No new storage backend**: files are stored as secrets in SQLite, so key rotation, TTL cleanup, backups, and tenant isolation work unchanged

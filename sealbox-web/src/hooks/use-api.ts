@@ -2,7 +2,11 @@ import { useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { createApiClient, queryKeys } from "@/lib/api";
 import { useAuthStore } from "@/stores/auth";
-import type { CreateSecretRequest, CreateMasterKeyRequest } from "@/lib/types";
+import type {
+  CreateSecretRequest,
+  CreateMasterKeyRequest,
+  RotateMasterKeyRequest,
+} from "@/lib/types";
 
 // Hook for creating API client
 export function useApiClient() {
@@ -110,7 +114,7 @@ export function useRotateMasterKey() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (data: CreateMasterKeyRequest) =>
+    mutationFn: (data: RotateMasterKeyRequest) =>
       apiClient!.rotateMasterKey(data),
     onSuccess: () => {
       // Refresh master keys and all secrets (affects encryption)
