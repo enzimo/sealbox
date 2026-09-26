@@ -9,7 +9,10 @@ use uuid::Uuid;
 use crate::crypto::{data_key::DataKey, master_key::PublicMasterKey};
 use crate::error::Result;
 
-pub use self::sqlite::{MigrationReport, inspect_migration_path};
+pub use self::sqlite::{
+    BackupReport, MigrationReport, RestoreReport, backup_database, inspect_migration_path,
+    restore_database, verify_backup,
+};
 pub(crate) use self::sqlite::{
     SqliteHealthRepo, SqliteMasterKeyRepo, SqliteSecretRepo, SqliteTenantRepo,
     backup_before_migration, create_db_connection, run_migrations,
@@ -250,6 +253,12 @@ pub(crate) trait SecretRepo: Send + Sync {
     fn update_secret_master_key(&self, conn: &rusqlite::Connection, secret: &Secret) -> Result<()>;
     /// Batch delete all expired secrets and return the count of deleted records.
     fn cleanup_expired_secrets(&self, conn: &rusqlite::Connection) -> Result<usize>;
+    /// Batch delete expired secrets in one tenant namespace.
+    fn cleanup_expired_secrets_in_namespace(
+        &self,
+        conn: &rusqlite::Connection,
+        namespace: &str,
+    ) -> Result<usize>;
     /// List all secrets with basic information (key, latest version, timestamps)
     fn list_secrets(&self, conn: &rusqlite::Connection, namespace: &str)
     -> Result<Vec<SecretInfo>>;

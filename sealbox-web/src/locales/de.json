@@ -1,5 +1,7 @@
 {
   "nav": {
+    "secrets": "Geheimnisse",
+    "keys": "Master-Schlüssel",
     "signOut": "Abmelden"
   },
   "login": {
@@ -7,20 +9,20 @@
     "subtitle": "Mit Ihrem Geheimnis-Verwaltungsserver verbinden",
     "serverUrl": "Server-URL",
     "serverUrlPlaceholder": "http://localhost:8080",
-    "token": "Authentifizierungs-Token",
-    "tokenPlaceholder": "Geben Sie Ihren Bearer Token ein",
+    "token": "Mandanten-API-Token",
+    "tokenPlaceholder": "Mandanten-Token eingeben (sbx_t_…)",
     "connect": "Verbinden",
     "connecting": "Verbinde...",
     "firstTime": "Erste Nutzung?",
     "steps": {
       "start": "sealbox-server starten",
-      "setToken": "AUTH_TOKEN Umgebungsvariable setzen",
+      "setToken": "Mandanten-Token mit 'sealbox-cli tenant create' erstellen",
       "enterDetails": "Server-URL und Token oben eingeben"
     },
     "errors": {
       "invalidUrl": "Bitte geben Sie eine gültige Server-URL ein",
       "tokenRequired": "Bitte geben Sie einen Authentifizierungs-Token ein",
-      "authFailed": "Authentifizierung fehlgeschlagen, bitte prüfen Sie Ihren Token",
+      "authFailed": "Authentifizierung fehlgeschlagen. Verwenden Sie einen Mandanten-Token, nicht den AUTH_TOKEN des Servers",
       "authError": "Authentifizierungsfehler: {{message}}",
       "connectionFailed": "Verbindung zum Server nicht möglich, bitte prüfen Sie die URL",
       "connectionError": "Verbindungsfehler: {{message}}"

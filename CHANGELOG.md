@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-26
+
+### Breaking
+- **The v1 API is disabled by default** (`LEGACY_V1_ENABLED=false`) and will be removed after 2026-11-25. Set `LEGACY_V1_ENABLED=true` to re-enable it temporarily; v1 responses then carry `Deprecation` and `Sunset` headers and the server logs a warning.
+- **The root `AUTH_TOKEN` no longer reads or writes secrets.** It creates tenants and issues tokens; all data access uses tenant tokens on `/v2`. Pre-tenant data is in the `legacy` tenant: `sealbox-cli --token $AUTH_TOKEN tenant token create legacy --token-file ...`
+- **The CLI defaults to `api_version = "v2"`.** Configs saved with `v1` print a deprecation warning; run `sealbox-cli config set server.api_version v2`.
+- **The web UI uses `/v2` and requires a tenant token** to log in.
+- `secret export` refuses to overwrite an existing file without `--force`.
+
+### Added
+- `key export` / `key import`: back up and restore the local key pair in a passphrase-encrypted bundle (Argon2id + AES-256-GCM)
+- `secret export --all-versions` exports every retained version, not just the latest
+- `secret export --passphrase` / `--passphrase-file` creates archives that can be imported without any RSA key
+- `secret import` checks the archive's key fingerprint and reports both fingerprints when `--private-key` points at the wrong key; it fails early if the target server has no active key
+- `sealbox-server backup` / `restore` and `sealbox-cli admin backup` (`GET /v2/admin/backup`) for integrity-checked whole-database snapshots
+- `DELETE /v2/cleanup-expired` (tenant) and `DELETE /v2/admin/cleanup-expired` (all tenants, root token)
+- `key status` reports the local public key fingerprint
+- `sealbox-server --version`
+- Web UI navigation links to the secrets and master keys pages
+
+### Changed
+- Archive envelope and payload format v2 (base64 values, key fingerprint). Version 1 archives still import.
+- Web UI login verifies the token against a v2 route instead of only the unauthenticated readiness probe
+
+### Fixed
+- Binary files could not be exported (archives required UTF-8 values)
+- Truncated ciphertext made `DataKey::decrypt` panic instead of returning an error
+- Web UI login errors rendered one word per line
+- `vite dev` crashed when the shell set `NODE_ENV=production`, and the first visit to the keys page forced a reload that signed the user out
+
+### Security
+- `PrivateMasterKey` redacts key material in `Debug` output
+
 ## [0.1.5] - 2026-09-16
 
 ### Added
@@ -86,6 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded SQLite storage
 - CLI tools for management
 
-[Unreleased]: https://github.com/enzimo/sealbox/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/enzimo/sealbox/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/enzimo/sealbox/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/enzimo/sealbox/compare/v0.1.0...v0.1.5
 [0.1.0]: https://github.com/enzimo/sealbox/releases/tag/v0.1.0

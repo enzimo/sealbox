@@ -150,7 +150,10 @@ impl DataKey {
     /// - Verifies data integrity and authentication tag
     /// - Input data must contain valid nonce and authentication tag
     pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
-        // Split nonce and ciphertext
+        // Split nonce and ciphertext; reject truncated input instead of panicking
+        if data.len() < 12 {
+            return Err(DataKeyCryptoError::InvalidNonceLength(data.len()));
+        }
         let (nonce_bytes, ciphertext) = data.split_at(12);
         let nonce = Nonce::try_from(nonce_bytes)
             .map_err(|_| DataKeyCryptoError::InvalidNonceLength(nonce_bytes.len()))?;
@@ -298,5 +301,17 @@ mod tests {
 
         // Keys should be different (extremely unlikely to be the same)
         assert_ne!(key1.as_bytes(), key2.as_bytes());
+    }
+
+    #[test]
+    fn test_decrypt_truncated_input_returns_error() {
+        let key = DataKey::new();
+
+        let result = key.decrypt(&[0u8; 5]);
+
+        assert!(matches!(
+            result,
+            Err(DataKeyCryptoError::InvalidNonceLength(5))
+        ));
     }
 }

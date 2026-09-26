@@ -214,8 +214,13 @@ impl Config {
 }
 
 fn default_api_version() -> String {
-    "v1".to_string()
+    "v2".to_string()
 }
+
+/// The v1 API is deprecated, disabled on servers by default, and removed after
+/// this date. TODO(2026-11-25): drop "v1" from `normalize_api_version` and
+/// delete `LEGACY_V1_WARNING`.
+pub(crate) const LEGACY_V1_WARNING: &str = "Warning: API version v1 is deprecated and will be removed after 2026-11-25. Servers disable it by default. Switch with 'sealbox-cli config set server.api_version v2' and use a tenant token (see 'Migrating from v1' in docs/cli-reference.md).";
 
 pub(crate) fn normalize_api_version(value: &str) -> Result<String> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -350,7 +355,7 @@ mod tests {
         config.apply_env_overrides().unwrap();
 
         assert_eq!(config.server.token, "file-token");
-        assert_eq!(config.server.api_version, "v1");
+        assert_eq!(config.server.api_version, "v2");
         assert_eq!(config.keys.public_key_path, public_key_file);
         assert_eq!(config.keys.private_key_path, private_key_file);
 

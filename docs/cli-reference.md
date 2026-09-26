@@ -15,6 +15,32 @@ counts, empty legacy namespace rows, and orphaned secret references. Normal
 startup creates `<STORE_PATH>.pre-tenant-v2.bak` before migrating populated
 legacy data.
 
+### `sealbox-server backup`
+
+Write a consistent, integrity-checked snapshot of the whole database. This is
+safe while the server is running. The destination must not already exist and
+is created with mode `0600`.
+
+```bash
+sealbox-server backup --out /backups/sealbox-$(date +%F).db [--store-path /var/lib/sealbox/sealbox.db]
+```
+
+### `sealbox-server restore`
+
+Replace the database with a snapshot. **Stop the server first.** The snapshot
+is verified before anything changes. An existing database is only replaced with
+`--force`, and it is moved aside to `<STORE_PATH>.pre-restore-<unix-time>.bak`
+(together with its `-wal`/`-shm` files) instead of being deleted.
+
+```bash
+sealbox-server restore --from /backups/sealbox-2026-09-26.db [--store-path /var/lib/sealbox/sealbox.db] [--force]
+```
+
+`--store-path` defaults to `STORE_PATH` for all three server commands. Secret
+values in a snapshot stay envelope-encrypted, so restoring one needs the same
+private keys as before. Snapshots also contain tenant metadata and token
+hashes, so protect them like the root token.
+
 ## Global Options
 
 All commands support these global options:
@@ -137,6 +163,49 @@ sealbox-cli key rotate [OPTIONS]
 **Options:**
 - `--url <url>` - Server URL (overrides config)
 - `--token <token>` - Authentication token (overrides config)
+
+### `key export`
+
+Back up the local key pair to a passphrase-encrypted bundle. The server only
+stores public keys, so this bundle, or another copy of the private key, is
+the only way to decrypt your secrets after losing this machine.
+
+```bash
+sealbox-cli key export --file <bundle> [--passphrase-file <path>] [--force]
+```
+
+- Reads the configured private key (`--private-key` overrides it). The public
+  key is derived from the private key, and export fails if the configured
+  public key file belongs to a different key.
+- The passphrase is read from `--passphrase-file`, then
+  `SEALBOX_BACKUP_PASSPHRASE`, then an interactive prompt (asked twice), then
+  piped stdin. It must be at least 12 characters.
+- Encryption: Argon2id (64 MiB, 3 passes) derives an AES-256-GCM key. The KDF
+  parameters and file type are authenticated.
+- The bundle records the key's `sha256:` fingerprint in the clear, so you can
+  match it to `key status` or `key list` output without the passphrase.
+- The file is created with mode `0600` and existing files are never overwritten
+  without `--force`.
+
+Store the bundle and the passphrase in different places.
+
+### `key import`
+
+Restore a key pair from a bundle created by `key export`.
+
+```bash
+sealbox-cli key import --file <bundle> [--passphrase-file <path>] \
+  [--private-key-path <path>] [--public-key-path <path>] [--force]
+```
+
+- Writes to the configured key paths unless `--private-key-path` or
+  `--public-key-path` is given.
+- Refuses to overwrite either file without `--force`, and checks both paths
+  before writing anything.
+- Verifies that the decrypted private key, the stored public key, and the
+  bundle's fingerprint all match.
+
+`key status` also reports the local `public_key_fingerprint`.
 
 ## Secret Management Commands
 
@@ -266,7 +335,15 @@ sealbox-cli secret delete old_password --version 1
 
 ### `secret export`
 
-Export latest secret versions to a Sealbox encrypted archive. The CLI decrypts each selected secret locally, writes a tar payload in memory, encrypts that tar payload with AES-256-GCM, and encrypts the archive data key with the configured public key.
+Export secrets to a Sealbox encrypted archive. The CLI decrypts each selected
+secret locally, writes a tar payload in memory, and encrypts it with
+AES-256-GCM. The archive key is protected in one of two ways:
+
+- **Public key (default):** wrapped with the configured public key. The archive
+  records that key's fingerprint, and importing it needs the matching private key.
+- **Passphrase (`--passphrase` / `--passphrase-file`):** derived from a
+  passphrase with Argon2id. You can import it without any RSA key, so it
+  survives losing your key pair.
 
 ```bash
 sealbox-cli secret export <file> [OPTIONS]
@@ -274,51 +351,69 @@ sealbox-cli secret export <file> [OPTIONS]
 
 **Options:**
 - `--keys <text>` - Export only keys containing this substring
+- `--all-versions` - Export every retained version of each key, not just the latest
+- `--passphrase` - Protect the archive with a passphrase instead of the public key
+- `--passphrase-file <path>` - Read the passphrase from a file (implies `--passphrase`); `SEALBOX_BACKUP_PASSPHRASE` also works
+- `--force` - Overwrite an existing archive file
 - `--format <format>` - Archive format: `encrypted-tar` or `sealbox-v1` (default: `encrypted-tar`)
-- `--url <url>` - Server URL (overrides config)
-- `--token <token>` - Authentication token (overrides config)
-- `--public-key <path>` - Public key used to encrypt the archive data key
-- `--private-key <path>` - Private key used to decrypt exported secrets
+- `--public-key <path>` - Public key used to protect the archive (default mode)
+- `--private-key <path>` - Private key used to decrypt the secrets being exported
 
 **Archive format:**
-- Outer file: JSON envelope with `envelope_version`, cipher names, and base64 ciphertext fields
+- Outer file: JSON envelope (`envelope_version` 2) with a `protection` block of method `rsa-oaep-sha256` (includes `public_key_fingerprint`) or `passphrase`
 - Encrypted payload: tar archive containing `manifest.json` and `secrets.json`
-- `manifest.json`: includes `format_version` so newer importers can migrate older payload structures
-- Output file permissions: `0600` on Unix when the CLI creates the file
+- `manifest.json`: `format_version` 2, `key_count`, `secret_count` (versions), `all_versions`
+- `secrets.json`: one record per version, with base64 values so binary files round-trip
+- Output file permissions: `0600` on Unix
+- Version 1 archives from earlier releases can still be imported
 
 **Examples:**
 ```bash
-# Export all latest secret versions
-sealbox-cli secret export backups/sealbox-export.tar.enc
+# Latest versions, protected by your public key
+sealbox-cli secret export backups/sealbox-export.json
 
-# Export only matching keys
-sealbox-cli secret export backups/db-secrets.tar.enc --keys db/
+# Full history, readable with only a passphrase
+sealbox-cli secret export backups/full-history.json --all-versions --passphrase
+
+# Only matching keys
+sealbox-cli secret export backups/db-secrets.json --keys db/
 ```
 
 ### `secret import`
 
-Import secrets from a Sealbox encrypted archive. The CLI decrypts the archive locally with the configured private key, reads the tar manifest version, migrates supported old structures, and stores each secret through the normal client-side encrypted write path.
+Import secrets from a Sealbox encrypted archive. The CLI decrypts the archive
+locally, then stores each record through the normal client-side encrypted write
+path. Records are **re-encrypted to the target server's active master key**,
+which does not have to be the key the archive was made with.
 
 ```bash
 sealbox-cli secret import <file> [OPTIONS]
 ```
 
 **Options:**
+- `--private-key <path>` - For public-key archives: the private key the archive was exported with. Use this when it differs from the configured key, for example on a new server set up with a fresh key pair.
+- `--passphrase-file <path>` - For passphrase archives: read the passphrase from a file (otherwise `SEALBOX_BACKUP_PASSPHRASE` or a prompt)
 - `--format <format>` - Archive format: `encrypted-tar` or `sealbox-v1` (default: `encrypted-tar`)
 - `--url <url>` - Server URL (overrides config)
 - `--token <token>` - Authentication token (overrides config)
-- `--private-key <path>` - Private key used to decrypt the archive data key
 
 **Import behavior:**
-- Imported records become new versions in the destination database
+- Detects the protection method from the archive; you do not need to specify it
+- For public-key archives, compares the private key's fingerprint with the archive before decrypting and reports both fingerprints on a mismatch
+- Fails before writing anything if the target server has no active master key (`key register` first)
+- Imports versions oldest first per key, so the newest exported version becomes current; version numbers restart on the target server and retention limits apply (files keep 3, credentials 10)
+- Imported records are added as new versions on top of any existing key with the same name
 - Plaintext metadata is preserved
-- Future `expires_at` values are converted back into TTL seconds at import time
-- Already expired records are skipped
-- Unsupported envelope or archive format versions are rejected
+- Future `expires_at` values are converted back into TTL seconds; already expired records are skipped
 
-**Example:**
+**Example: restore onto a new server that already has its own key pair**
 ```bash
-sealbox-cli secret import backups/sealbox-export.tar.enc
+# The new server's config points at its own fresh key pair (already registered).
+sealbox-cli secret import backups/sealbox-export.json \
+  --private-key ~/old-machine/private_key.pem
+
+# Secrets are now encrypted to the new key and readable with the configured key.
+sealbox-cli secret get db/password
 ```
 
 ## Password Generation Commands
@@ -471,15 +566,18 @@ TTL allows secrets to automatically expire and be deleted:
 - **One-time secrets**: Passwords that should be short-lived
 - **Development**: Temporary configurations for testing
 
-### Manual Cleanup (Admin)
+### Manual Cleanup
 
-While the CLI doesn't have a direct admin command, you can manually trigger cleanup:
+There is no CLI command for this; call the API directly:
 
 ```bash
-# Using curl to trigger manual cleanup
-curl -X DELETE \
-  -H "Authorization: Bearer your-token" \
-  http://localhost:8080/v1/admin/cleanup-expired
+# Expired secrets in your tenant (tenant token)
+curl -X DELETE -H "Authorization: Bearer $TENANT_TOKEN" \
+  http://localhost:8080/v2/cleanup-expired
+
+# Expired secrets in every tenant (root token)
+curl -X DELETE -H "Authorization: Bearer $AUTH_TOKEN" \
+  http://localhost:8080/v2/admin/cleanup-expired
 
 # Response shows cleanup statistics
 {
@@ -488,21 +586,39 @@ curl -X DELETE \
 }
 ```
 
-## Legacy Commands
+## Migrating from v1
 
-### `master-key create`
+The v1 API is **deprecated, disabled by default, and will be removed after
+2026-11-25**. It used the server root token for data access and stored
+everything in a built-in tenant named `legacy`. v2 is the default for the
+server, the CLI, and the web UI.
 
-Legacy command for key generation and registration in one step.
+Data written through v1 is still in the `legacy` tenant. To keep using it,
+issue a tenant token for that tenant with the root token and switch the client
+to v2:
 
 ```bash
-sealbox-cli master-key create [OPTIONS]
+# Root token: issue a token for the pre-tenant data
+sealbox-cli --token "$AUTH_TOKEN" tenant token create legacy \
+  --label "v1 migration" --token-file ~/.config/sealbox/tenant_token
+
+# Point the CLI at v2 and the new token (existing key files stay the same)
+sealbox-cli config set server.api_version v2
+sealbox-cli config set server.token "$(cat ~/.config/sealbox/tenant_token)"
+sealbox-cli secret list
 ```
 
-**Options:**
-- `--url <url>` - Server URL
-- `--token <token>` - Authentication token
-- `--public-key-path <path>` - Public key file path
-- `--private-key-path <path>` - Private key file path
+Config files written by older CLIs may contain `api_version = "v1"`. The CLI
+then prints a deprecation warning, and requests fail with `404` because servers
+now disable v1. Run the `config set` command above to fix this.
+
+Commands that use the root token (`tenant ...` and `admin backup`) are not
+affected by `api_version`. Pass the root token with `--token` when your
+configured token is a tenant token.
+
+If a client cannot move yet, set `LEGACY_V1_ENABLED=true` on the server. v1
+responses carry `Deprecation` and `Sunset` headers, and the server logs a
+warning at startup.
 
 ## Output Formats
 
@@ -555,6 +671,8 @@ CLI commands can be configured using environment variables:
 - `SEALBOX_PUBLIC_KEY_FILE` - Mounted public key file path
 - `SEALBOX_PRIVATE_KEY_FILE` - Mounted private key file path
 - `SEALBOX_OUTPUT_FORMAT` - Default output format
+- `SEALBOX_API_VERSION` - `v2` (default) or the deprecated `v1`
+- `SEALBOX_BACKUP_PASSPHRASE` - Passphrase for `key export`/`key import` and passphrase-protected archives, when `--passphrase-file` is not given
 
 ## Exit Codes
 
@@ -563,6 +681,21 @@ CLI commands can be configured using environment variables:
 - `2` - Authentication error
 - `3` - Network/connection error
 - `4` - File/configuration error
+## Server Backup Commands
+
+### `admin backup`
+
+Download a consistent snapshot of the whole server database through
+`GET /v2/admin/backup`. Requires the root token (`AUTH_TOKEN`). Tenant tokens
+are rejected.
+
+```bash
+sealbox-cli admin backup --file backups/sealbox.db [--force]
+```
+
+The response is checked to be a SQLite database and written with mode `0600`.
+Restore it with `sealbox-server restore`.
+
 ## Tenant Administration Commands
 
 Tenant commands require the server root token. New token values are never

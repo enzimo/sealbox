@@ -1,5 +1,7 @@
 {
   "nav": {
+    "secrets": "シークレット",
+    "keys": "マスターキー",
     "signOut": "サインアウト"
   },
   "login": {
@@ -7,20 +9,20 @@
     "subtitle": "シークレット管理サーバーに接続",
     "serverUrl": "サーバーURL",
     "serverUrlPlaceholder": "http://localhost:8080",
-    "token": "認証トークン",
-    "tokenPlaceholder": "Bearer Tokenを入力してください",
+    "token": "テナントAPIトークン",
+    "tokenPlaceholder": "テナントトークン（sbx_t_…）を入力してください",
     "connect": "接続",
     "connecting": "接続中...",
     "firstTime": "初回使用ですか？",
     "steps": {
       "start": "sealbox-serverを起動",
-      "setToken": "AUTH_TOKEN環境変数を設定",
+      "setToken": "'sealbox-cli tenant create' でテナントトークンを作成",
       "enterDetails": "上記にサーバーURLとトークンを入力"
     },
     "errors": {
       "invalidUrl": "有効なサーバーURLを入力してください",
       "tokenRequired": "認証トークンを入力してください",
-      "authFailed": "認証に失敗しました。トークンを確認してください",
+      "authFailed": "認証に失敗しました。サーバーの AUTH_TOKEN ではなくテナントトークンを使用してください",
       "authError": "認証エラー：{{message}}",
       "connectionFailed": "サーバーに接続できません。URLを確認してください",
       "connectionError": "接続エラー：{{message}}"

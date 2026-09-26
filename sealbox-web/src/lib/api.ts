@@ -12,6 +12,10 @@ import type {
   ApiError,
 } from "./types";
 
+// Tenant-scoped API. Log in with a tenant token; the server's root AUTH_TOKEN
+// is rejected here.
+const API_PREFIX = "/v2";
+
 export class SealboxApiError extends Error {
   constructor(
     message: string,
@@ -112,24 +116,24 @@ export class SealboxApi {
 
   // Secret management API
   async listSecrets(): Promise<SecretsListResponse> {
-    return this.request<SecretsListResponse>("/v1/secrets");
+    return this.request<SecretsListResponse>(`${API_PREFIX}/secrets`);
   }
 
   async getSecret(key: string, version?: number): Promise<Secret> {
     const queryParam = version ? `?version=${version}` : "";
     return this.request<Secret>(
-      `/v1/secrets/${encodeURIComponent(key)}${queryParam}`,
+      `${API_PREFIX}/secrets/${encodeURIComponent(key)}${queryParam}`,
     );
   }
 
   async getSecretHistory(key: string): Promise<SecretHistoryResponse> {
     return this.request<SecretHistoryResponse>(
-      `/v1/secrets/${encodeURIComponent(key)}/history`,
+      `${API_PREFIX}/secrets/${encodeURIComponent(key)}/history`,
     );
   }
 
   async createSecret(key: string, data: CreateSecretRequest): Promise<Secret> {
-    return this.request<Secret>(`/v1/secrets/${encodeURIComponent(key)}`, {
+    return this.request<Secret>(`${API_PREFIX}/secrets/${encodeURIComponent(key)}`, {
       method: "PUT",
       body: JSON.stringify(data),
     });
@@ -138,7 +142,7 @@ export class SealboxApi {
   async deleteSecret(key: string, version?: number): Promise<void> {
     const queryParam = version !== undefined ? `?version=${version}` : "";
     return this.request<void>(
-      `/v1/secrets/${encodeURIComponent(key)}${queryParam}`,
+      `${API_PREFIX}/secrets/${encodeURIComponent(key)}${queryParam}`,
       {
         method: "DELETE",
       },
@@ -147,26 +151,26 @@ export class SealboxApi {
 
   // Master key management API
   async listMasterKeys(): Promise<MasterKeysListResponse> {
-    return this.request<MasterKeysListResponse>("/v1/master-key");
+    return this.request<MasterKeysListResponse>(`${API_PREFIX}/master-key`);
   }
 
   async createMasterKey(data: CreateMasterKeyRequest): Promise<void> {
-    return this.request<void>("/v1/master-key", {
+    return this.request<void>(`${API_PREFIX}/master-key`, {
       method: "POST",
       body: JSON.stringify(data),
     });
   }
 
   async rotateMasterKey(data: RotateMasterKeyRequest): Promise<void> {
-    return this.request<void>("/v1/master-key", {
+    return this.request<void>(`${API_PREFIX}/master-key`, {
       method: "PUT",
       body: JSON.stringify(data),
     });
   }
 
-  // Admin API
+  // Removes expired secrets in the current tenant only
   async cleanupExpiredSecrets(): Promise<CleanupExpiredResponse> {
-    return this.request<CleanupExpiredResponse>("/v1/admin/cleanup-expired", {
+    return this.request<CleanupExpiredResponse>(`${API_PREFIX}/cleanup-expired`, {
       method: "DELETE",
     });
   }

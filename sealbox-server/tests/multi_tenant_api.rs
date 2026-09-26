@@ -10,7 +10,7 @@ use tower::ServiceExt;
 use sealbox_server::{config::SealboxConfig, create_app};
 
 struct TestServer {
-    _dir: TempDir,
+    dir: TempDir,
     app: Router,
     root_token: String,
 }
@@ -27,7 +27,7 @@ impl TestServer {
         };
         let app = create_app(&config).unwrap();
         Self {
-            _dir: dir,
+            dir,
             app,
             root_token,
         }
@@ -58,6 +58,13 @@ impl TestServer {
         let value = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }));
         (status, value)
+    }
+
+    /// Mark every stored version of `key` as already expired.
+    fn expire(&self, key: &str) {
+        let conn = rusqlite::Connection::open(self.dir.path().join("sealbox.db")).unwrap();
+        conn.execute("UPDATE secrets SET expires_at = 1 WHERE key = ?1", [key])
+            .unwrap();
     }
 
     async fn create_tenant(&self, name: &str) -> (String, String) {
@@ -246,4 +253,216 @@ async fn legacy_v1_routes_can_be_disabled() {
     let response = app.oneshot(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_backup_returns_restorable_snapshot_for_root_only() {
+    let server = TestServer::new();
+    let (tenant_id, tenant_token) = server.create_tenant("Tenant").await;
+    let master_key_id = server.register_key(&tenant_token, "public-key").await;
+    let (status, _) = server
+        .save_secret(&tenant_token, "db-password", &master_key_id, vec![1, 2, 3])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = server
+        .json(Method::GET, "/v2/admin/backup", &tenant_token, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/v2/admin/backup")
+        .header("Authorization", format!("Bearer {}", server.root_token))
+        .body(Body::empty())
+        .unwrap();
+    let response = server.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/vnd.sqlite3"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let backup_path = dir.path().join("backup.db");
+    std::fs::write(&backup_path, &bytes).unwrap();
+    let report = sealbox_server::repo::verify_backup(&backup_path).unwrap();
+    assert_eq!(report.secret_version_count, 1);
+    assert_eq!(report.master_key_count, 1);
+
+    // The snapshot must serve the same data when a server starts from it.
+    let restored_store = dir.path().join("restored.db");
+    sealbox_server::repo::restore_database(&backup_path, &restored_store, false).unwrap();
+    let restored = create_app(&SealboxConfig {
+        auth_token: server.root_token.clone(),
+        store_path: restored_store.display().to_string(),
+        listen_addr: "127.0.0.1:0".to_string(),
+        legacy_v1_enabled: true,
+    })
+    .unwrap();
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/v2/secrets/db-password")
+        .header("Authorization", format!("Bearer {tenant_token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = restored.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "tenant {tenant_id}");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["encrypted_data"], json!([1, 2, 3]));
+}
+
+#[tokio::test]
+async fn legacy_v1_is_disabled_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = SealboxConfig {
+        store_path: dir.path().join("sealbox.db").display().to_string(),
+        ..SealboxConfig::default()
+    };
+    let app = create_app(&config).unwrap();
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/secrets")
+        .header("Authorization", format!("Bearer {}", config.auth_token))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn enabled_v1_responses_carry_deprecation_headers() {
+    let server = TestServer::new();
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/secrets")
+        .header("Authorization", format!("Bearer {}", server.root_token))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = server.app.clone().oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["deprecation"], "true");
+    assert_eq!(
+        response.headers()["sunset"],
+        sealbox_server::config::LEGACY_V1_SUNSET_HTTP_DATE
+    );
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/v2/admin/tenants")
+        .header("Authorization", format!("Bearer {}", server.root_token))
+        .body(Body::empty())
+        .unwrap();
+    let response = server.app.clone().oneshot(request).await.unwrap();
+    assert!(response.headers().get("deprecation").is_none());
+}
+
+/// Pre-tenant data lives in the `legacy` tenant. Issuing a token for it is the
+/// migration path from v1 to v2.
+#[tokio::test]
+async fn legacy_tenant_token_reads_v1_data_over_v2() {
+    let server = TestServer::new();
+    let (status, key) = server
+        .json(
+            Method::POST,
+            "/v1/master-key",
+            &server.root_token,
+            Some(json!({ "public_key": "legacy-public-key" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{key}");
+    let (status, _) = server
+        .json(
+            Method::PUT,
+            "/v1/secrets/old-secret",
+            &server.root_token,
+            Some(json!({
+                "encrypted_data": [4, 5, 6],
+                "encrypted_data_key": [9, 8, 7],
+                "master_key_id": key["id"],
+                "ttl": null,
+                "metadata": null
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, issued) = server
+        .json(
+            Method::POST,
+            "/v2/admin/tenants/legacy/tokens",
+            &server.root_token,
+            Some(json!({ "label": "v1 migration" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{issued}");
+    let legacy_token = issued["token"].as_str().unwrap();
+
+    let (status, secret) = server
+        .json(Method::GET, "/v2/secrets/old-secret", legacy_token, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{secret}");
+    assert_eq!(secret["encrypted_data"], json!([4, 5, 6]));
+    let (status, keys) = server
+        .json(Method::GET, "/v2/master-key", legacy_token, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(keys["master_keys"][0]["id"], key["id"]);
+}
+
+#[tokio::test]
+async fn cleanup_expired_is_tenant_scoped_for_tenants_and_global_for_root() {
+    let server = TestServer::new();
+    let (_, token_a) = server.create_tenant("Tenant A").await;
+    let (_, token_b) = server.create_tenant("Tenant B").await;
+    let key_a = server.register_key(&token_a, "public-a").await;
+    let key_b = server.register_key(&token_b, "public-b").await;
+    server
+        .save_secret(&token_a, "expired-a", &key_a, vec![1])
+        .await;
+    server
+        .save_secret(&token_b, "expired-b", &key_b, vec![2])
+        .await;
+    server.expire("expired-a");
+    server.expire("expired-b");
+
+    let (status, _) = server
+        .json(
+            Method::DELETE,
+            "/v2/cleanup-expired",
+            &server.root_token,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = server
+        .json(Method::DELETE, "/v2/admin/cleanup-expired", &token_a, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) = server
+        .json(Method::DELETE, "/v2/cleanup-expired", &token_a, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deleted_count"], 1);
+
+    let (status, body) = server
+        .json(
+            Method::DELETE,
+            "/v2/admin/cleanup-expired",
+            &server.root_token,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["deleted_count"], 1,
+        "tenant B's secret remained until root cleanup"
+    );
 }

@@ -1,3 +1,4 @@
+mod backup;
 pub(crate) mod health;
 pub(crate) mod master_key;
 mod migrations;
@@ -8,7 +9,10 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
-pub use self::migrations::{MigrationReport, inspect_migration_path};
+pub use self::{
+    backup::{BackupReport, RestoreReport, backup_database, restore_database, verify_backup},
+    migrations::{MigrationReport, inspect_migration_path},
+};
 pub(crate) use self::{
     health::SqliteHealthRepo,
     master_key::SqliteMasterKeyRepo,

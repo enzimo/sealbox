@@ -18,10 +18,16 @@ import {
   Server,
   WifiOff,
   Loader2,
+  KeyRound,
+  LockKeyhole,
 } from "lucide-react";
+import { Link } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { useAuthStore } from "@/stores/auth";
 import { useServerStatus } from "@/hooks/useServerStatus";
+
+const navLinkClassName =
+  "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground data-[status=active]:bg-accent data-[status=active]:font-medium data-[status=active]:text-foreground";
 
 export function Navigation() {
   const { t } = useTranslation();
@@ -60,6 +66,23 @@ export function Navigation() {
                   BETA
                 </Badge>
               </div>
+            </div>
+
+            {/* Page links. Keep navigation client-side: the token lives only in
+                memory, so a full page load signs the user out. */}
+            <div className="flex items-center space-x-1 pl-4">
+              <Link
+                to="/"
+                activeOptions={{ exact: true }}
+                className={navLinkClassName}
+              >
+                <LockKeyhole className="h-3.5 w-3.5" />
+                <span>{t("nav.secrets")}</span>
+              </Link>
+              <Link to="/keys" className={navLinkClassName}>
+                <KeyRound className="h-3.5 w-3.5" />
+                <span>{t("nav.keys")}</span>
+              </Link>
             </div>
           </div>
 

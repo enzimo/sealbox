@@ -1,5 +1,7 @@
 {
   "nav": {
+    "secrets": "密钥",
+    "keys": "主密钥",
     "signOut": "退出登录"
   },
   "login": {
@@ -7,20 +9,20 @@
     "subtitle": "连接到您的密钥管理服务器",
     "serverUrl": "服务器地址",
     "serverUrlPlaceholder": "http://localhost:8080",
-    "token": "认证令牌",
-    "tokenPlaceholder": "输入您的Bearer令牌",
+    "token": "租户 API 令牌",
+    "tokenPlaceholder": "输入您的租户令牌（sbx_t_…）",
     "connect": "连接",
     "connecting": "连接中...",
     "firstTime": "初次使用？",
     "steps": {
       "start": "启动 sealbox-server",
-      "setToken": "设置 AUTH_TOKEN 环境变量",
+      "setToken": "使用 'sealbox-cli tenant create' 创建租户令牌",
       "enterDetails": "在上方输入服务器地址和令牌"
     },
     "errors": {
       "invalidUrl": "请输入有效的服务器地址",
       "tokenRequired": "请输入认证令牌",
-      "authFailed": "认证失败，请检查您的令牌",
+      "authFailed": "认证失败。请使用租户令牌，而不是服务器的 AUTH_TOKEN",
       "authError": "认证错误：{{message}}",
       "connectionFailed": "无法连接到服务器，请检查地址",
       "connectionError": "连接错误：{{message}}"

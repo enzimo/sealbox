@@ -551,6 +551,28 @@ impl SecretRepo for SqliteSecretRepo {
         Ok(deleted_count)
     }
 
+    fn cleanup_expired_secrets_in_namespace(
+        &self,
+        conn: &rusqlite::Connection,
+        namespace: &str,
+    ) -> Result<usize> {
+        info!(
+            "cleanup_expired_secrets_in_namespace: namespace={}",
+            namespace
+        );
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let deleted_count = conn.execute(
+            "DELETE FROM secrets
+             WHERE namespace = ?1 AND expires_at IS NOT NULL AND expires_at < ?2",
+            (namespace, now),
+        )?;
+        info!(
+            "Cleaned up {} expired secrets in namespace {}",
+            deleted_count, namespace
+        );
+        Ok(deleted_count)
+    }
+
     fn list_secrets(
         &self,
         conn: &rusqlite::Connection,

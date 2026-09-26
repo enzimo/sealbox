@@ -1,5 +1,17 @@
 use std::{env, fs};
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+/// Date after which the deprecated v1 API is deleted from the codebase.
+///
+/// TODO(2026-11-25): remove v1. Delete `legacy_v1_enabled`/`LEGACY_V1_ENABLED`,
+/// the `legacy_routes` router and its `/{version}/...` handlers in `api/`
+/// (`secret::{get,save,delete,list,history}`, the non-`_v2` `master_key`
+/// handlers, `admin::cleanup_expired`), the `Version` path enum, and the CLI's
+/// `v1` API version. See "v1 API removal" in AGENTS.md.
+pub const LEGACY_V1_REMOVAL_DATE: &str = "2026-11-25";
+
+/// `Sunset` header value (RFC 8594) sent on every v1 response.
+pub const LEGACY_V1_SUNSET_HTTP_DATE: &str = "Wed, 25 Nov 2026 00:00:00 GMT";
 
 /// Sealbox configuration struct
 #[derive(Debug, Clone)]
@@ -39,11 +51,17 @@ impl SealboxConfig {
             }
         };
 
+        // v1 is deprecated and off unless explicitly re-enabled.
         let legacy_v1_enabled = match env::var("LEGACY_V1_ENABLED") {
             Ok(value) => Self::parse_bool("LEGACY_V1_ENABLED", &value)?,
-            Err(env::VarError::NotPresent) => true,
+            Err(env::VarError::NotPresent) => false,
             Err(err) => return Err(format!("failed to read LEGACY_V1_ENABLED: {err}")),
         };
+        if legacy_v1_enabled {
+            warn!(
+                "LEGACY_V1_ENABLED=true: the deprecated v1 API is enabled and will be removed after {LEGACY_V1_REMOVAL_DATE}. Move clients to /v2 with tenant tokens."
+            );
+        }
 
         info!(
             "Sealbox configuration loaded: {:?}",
@@ -92,7 +110,7 @@ impl Default for SealboxConfig {
             auth_token: "test-token".to_string(),
             store_path: ":memory:".to_string(),
             listen_addr: "127.0.0.1:8080".to_string(),
-            legacy_v1_enabled: true,
+            legacy_v1_enabled: false,
         }
     }
 }
@@ -112,13 +130,13 @@ mod tests {
             std::env::set_var("AUTH_TOKEN_FILE", &token_file);
             std::env::set_var("STORE_PATH", ":memory:");
             std::env::set_var("LISTEN_ADDR", "127.0.0.1:0");
-            std::env::set_var("LEGACY_V1_ENABLED", "false");
+            std::env::set_var("LEGACY_V1_ENABLED", "true");
         }
 
         let config = SealboxConfig::from_env().expect("Should load config");
 
         assert_eq!(config.auth_token, "file-token");
-        assert!(!config.legacy_v1_enabled);
+        assert!(config.legacy_v1_enabled);
 
         unsafe {
             std::env::remove_var("AUTH_TOKEN_FILE");
@@ -126,6 +144,11 @@ mod tests {
             std::env::remove_var("LISTEN_ADDR");
             std::env::remove_var("LEGACY_V1_ENABLED");
         }
+    }
+
+    #[test]
+    fn legacy_v1_is_disabled_by_default() {
+        assert!(!SealboxConfig::default().legacy_v1_enabled);
     }
 
     #[test]
