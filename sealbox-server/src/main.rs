@@ -10,7 +10,7 @@ use tracing::{error, info};
 use tracing_subscriber::{self, EnvFilter};
 
 #[derive(Debug, Parser)]
-#[command(name = "sealbox-server")]
+#[command(name = "sealbox-server", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<ServerCommand>,
