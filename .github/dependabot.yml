@@ -36,6 +36,10 @@ updates:
     labels:
       - "dependencies"
       - "github-actions"
+    ignore:
+      # The ref is the Rust version to install (the MSRV job pins 1.95.0),
+      # so Dependabot's "updates" name toolchains that don't exist.
+      - dependency-name: "dtolnay/rust-toolchain"
 
   # Docker
   - package-ecosystem: "docker"

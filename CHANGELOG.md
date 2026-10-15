@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-15
+
+### Changed
+- Dependency updates: `dirs` 7.0, `tabled` 0.22, and minor and patch updates across the workspace.
+- The Docker image builds with Rust 1.99.
+- Dependabot no longer proposes `dtolnay/rust-toolchain` updates; that action's ref is the Rust version the MSRV job tests.
+
 ## [0.2.1] - 2026-10-15
 
 ### Security
@@ -128,7 +135,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Embedded SQLite storage
 - CLI tools for management
 
-[Unreleased]: https://github.com/enzimo/sealbox/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/enzimo/sealbox/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/enzimo/sealbox/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/enzimo/sealbox/releases/tag/v0.2.1
 [0.2.0]: #020---2026-09-26
 [0.1.5]: #015---2026-09-16
