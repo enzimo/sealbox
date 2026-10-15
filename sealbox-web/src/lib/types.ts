@@ -1,0 +1,118 @@
+// Type definitions corresponding to sealbox-server API
+
+export interface SecretInfo {
+  key: string;
+  version: number;
+  created_at: number;
+  updated_at: number;
+  expires_at?: number;
+  metadata?: string;
+}
+
+export interface Secret {
+  namespace: string;
+  key: string;
+  version: number;
+  encrypted_data: number[];
+  encrypted_data_key: number[];
+  master_key_id: string;
+  created_at: number;
+  updated_at: number;
+  expires_at?: number;
+  metadata?: string;
+}
+
+export interface MasterKey {
+  id: string;
+  public_key: string;
+  created_at: number;
+  status: "Active" | "Retired" | "Disabled";
+  description?: string;
+  metadata?: string;
+}
+
+// API request/response types
+export interface SecretsListResponse {
+  secrets: SecretInfo[];
+}
+
+export interface SecretHistoryResponse {
+  versions: SecretInfo[];
+}
+
+export interface CreateSecretRequest {
+  encrypted_data: number[];
+  encrypted_data_key: number[];
+  master_key_id: string;
+  ttl?: number;
+  metadata?: string;
+}
+
+export interface CreateMasterKeyRequest {
+  public_key: string;
+}
+
+export interface RewrappedSecretDataKey {
+  namespace: string;
+  key: string;
+  version: number;
+  encrypted_data_key: number[];
+}
+
+export interface RotateMasterKeyRequest {
+  old_master_key_id: string;
+  new_master_key_id: string;
+  updates: RewrappedSecretDataKey[];
+}
+
+export interface MasterKeysListResponse {
+  master_keys: MasterKey[];
+}
+
+export interface CleanupExpiredResponse {
+  deleted_count: number;
+  cleaned_at: number;
+}
+
+// Error response types
+export interface ApiError {
+  error: string;
+  message?: string;
+}
+
+// Health check response types
+export interface HealthResponse {
+  result: string;
+  timestamp: number;
+}
+
+// UI display status for secrets
+export type SecretStatus = "active" | "expiring" | "expired";
+
+// Simplified UI data matching server capabilities
+export interface SecretUIData {
+  key: string;
+  version: number;
+  created_at: number;
+  updated_at: number;
+  expires_at?: number;
+  metadata?: string;
+  // Computed display fields
+  status: SecretStatus;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt?: string;
+}
+
+// Configuration types
+export interface AppConfig {
+  serverUrl: string;
+  token?: string;
+}
+
+// Authentication state types
+export interface AuthState {
+  isAuthenticated: boolean;
+  token?: string;
+  serverUrl?: string;
+}

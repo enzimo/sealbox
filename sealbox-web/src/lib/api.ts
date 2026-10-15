@@ -1,0 +1,207 @@
+import type {
+  SecretInfo,
+  Secret,
+  MasterKey,
+  SecretsListResponse,
+  SecretHistoryResponse,
+  CreateSecretRequest,
+  CreateMasterKeyRequest,
+  RotateMasterKeyRequest,
+  MasterKeysListResponse,
+  CleanupExpiredResponse,
+  ApiError,
+} from "./types";
+
+// Tenant-scoped API. Log in with a tenant token; the server's root AUTH_TOKEN
+// is rejected here.
+const API_PREFIX = "/v2";
+
+export class SealboxApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public body?: any,
+  ) {
+    super(message);
+    this.name = "SealboxApiError";
+  }
+}
+
+export class SealboxApi {
+  private baseUrl: string;
+  private token?: string;
+
+  constructor(baseUrl: string, token?: string) {
+    this.baseUrl = baseUrl.replace(/\/$/, ""); // Remove trailing slash
+    this.token = token;
+  }
+
+  setToken(token: string) {
+    this.token = token;
+  }
+
+  setBaseUrl(baseUrl: string) {
+    this.baseUrl = baseUrl.replace(/\/$/, "");
+  }
+
+  private async request<T>(
+    endpoint: string,
+    options: RequestInit = {},
+  ): Promise<T> {
+    const url = `${this.baseUrl}${endpoint}`;
+
+    const headers = new Headers({
+      "Content-Type": "application/json",
+      ...options.headers,
+    });
+
+    if (this.token) {
+      headers.set("Authorization", `Bearer ${this.token}`);
+    }
+
+    const response = await fetch(url, {
+      ...options,
+      headers,
+    });
+
+    if (!response.ok) {
+      let errorBody;
+      try {
+        errorBody = await response.json();
+      } catch {
+        errorBody = { error: response.statusText };
+      }
+
+      throw new SealboxApiError(
+        errorBody.error || errorBody.message || `HTTP ${response.status}`,
+        response.status,
+        errorBody,
+      );
+    }
+
+    if (response.status === 204) {
+      return {} as T;
+    }
+
+    return response.json();
+  }
+
+  private async requestWithTiming<T>(
+    endpoint: string,
+    options: RequestInit = {},
+  ): Promise<T & { responseTime: number }> {
+    const startTime = performance.now();
+    
+    try {
+      const result = await this.request<T>(endpoint, options);
+      const endTime = performance.now();
+      const responseTime = Math.round(endTime - startTime);
+      
+      return {
+        ...result,
+        responseTime,
+      };
+    } catch (error) {
+      const endTime = performance.now();
+      const responseTime = Math.round(endTime - startTime);
+      
+      if (error instanceof SealboxApiError) {
+        // Add response time to error for potential debugging
+        (error as any).responseTime = responseTime;
+      }
+      
+      throw error;
+    }
+  }
+
+  // Secret management API
+  async listSecrets(): Promise<SecretsListResponse> {
+    return this.request<SecretsListResponse>(`${API_PREFIX}/secrets`);
+  }
+
+  async getSecret(key: string, version?: number): Promise<Secret> {
+    const queryParam = version ? `?version=${version}` : "";
+    return this.request<Secret>(
+      `${API_PREFIX}/secrets/${encodeURIComponent(key)}${queryParam}`,
+    );
+  }
+
+  async getSecretHistory(key: string): Promise<SecretHistoryResponse> {
+    return this.request<SecretHistoryResponse>(
+      `${API_PREFIX}/secrets/${encodeURIComponent(key)}/history`,
+    );
+  }
+
+  async createSecret(key: string, data: CreateSecretRequest): Promise<Secret> {
+    return this.request<Secret>(`${API_PREFIX}/secrets/${encodeURIComponent(key)}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async deleteSecret(key: string, version?: number): Promise<void> {
+    const queryParam = version !== undefined ? `?version=${version}` : "";
+    return this.request<void>(
+      `${API_PREFIX}/secrets/${encodeURIComponent(key)}${queryParam}`,
+      {
+        method: "DELETE",
+      },
+    );
+  }
+
+  // Master key management API
+  async listMasterKeys(): Promise<MasterKeysListResponse> {
+    return this.request<MasterKeysListResponse>(`${API_PREFIX}/master-key`);
+  }
+
+  async createMasterKey(data: CreateMasterKeyRequest): Promise<void> {
+    return this.request<void>(`${API_PREFIX}/master-key`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    });
+  }
+
+  async rotateMasterKey(data: RotateMasterKeyRequest): Promise<void> {
+    return this.request<void>(`${API_PREFIX}/master-key`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    });
+  }
+
+  // Removes expired secrets in the current tenant only
+  async cleanupExpiredSecrets(): Promise<CleanupExpiredResponse> {
+    return this.request<CleanupExpiredResponse>(`${API_PREFIX}/cleanup-expired`, {
+      method: "DELETE",
+    });
+  }
+
+  // Health check
+  async health(): Promise<{ result: string; timestamp: number }> {
+    return this.request<{ result: string; timestamp: number }>("/healthz/live");
+  }
+
+  // Health check with response time measurement
+  async healthWithTiming(): Promise<{ result: string; timestamp: number; responseTime: number }> {
+    return this.requestWithTiming<{ result: string; timestamp: number }>("/healthz/live");
+  }
+
+  // Readiness check
+  async readiness(): Promise<{ result: string; timestamp: number }> {
+    return this.request<{ result: string; timestamp: number }>(
+      "/healthz/ready",
+    );
+  }
+}
+
+// Create default instance
+export const createApiClient = (baseUrl: string, token?: string) => {
+  return new SealboxApi(baseUrl, token);
+};
+
+// Query keys for React Query
+export const queryKeys = {
+  secrets: ["secrets"] as const,
+  secret: (key: string, version?: number) => ["secret", key, version] as const,
+  secretHistory: (key: string) => ["secret-history", key] as const,
+  masterKeys: ["masterKeys"] as const,
+} as const;

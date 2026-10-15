@@ -1,0 +1,30 @@
+[package]
+name = "sealbox-cli"
+version = "0.2.1"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+sealbox-server = { path = "../sealbox-server" }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+rsa = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+time = { workspace = true, features = ["formatting", "local-offset"] }
+toml = "1.1"
+dirs = "6.0"
+tabled = "0.21"
+rpassword = "7.5"
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+comfy-table = "8.0"
+uuid = { workspace = true }
+rand = { workspace = true }
+tar = "0.4"
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

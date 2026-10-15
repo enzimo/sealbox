@@ -1,0 +1,124 @@
+name: Security Audit
+
+# CI audits dependencies on every push and pull request, which gates changes but
+# only runs when someone pushes. Advisories are published continuously against
+# versions that are already pinned, so this workflow re-audits the default
+# branch on a schedule to catch findings that appear between commits.
+on:
+  schedule:
+    # Mondays at 06:00 UTC, an hour before the weekly dependency PRs.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+# A scheduled audit must not race with itself; the newest run wins.
+concurrency:
+  group: security-audit
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache advisory database
+      uses: actions/cache@v6
+      with:
+        path: ~/.cargo/advisory-db
+        key: ${{ runner.os }}-advisory-db-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-advisory-db-
+
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+
+    # Intentional suppressions live in .cargo/audit.toml so this workflow and
+    # the CI security job cannot disagree about what is being ignored. No
+    # --ignore flag here for that reason.
+    - name: Run dependency audit
+      id: audit
+      continue-on-error: true
+      run: |
+        set +e
+        cargo audit > "$RUNNER_TEMP/audit-report.txt" 2>&1
+        audit_code=$?
+        set -e
+        cat "$RUNNER_TEMP/audit-report.txt"
+        echo "exit_code=$audit_code" >> "$GITHUB_OUTPUT"
+
+    - name: Add audit report to job summary
+      if: always()
+      run: |
+        {
+          echo "## Dependency audit"
+          echo
+          if [ "${{ steps.audit.outputs.exit_code }}" = "0" ]; then
+            echo "No known vulnerabilities found."
+          else
+            echo "Vulnerabilities found. Bump the affected crates and re-run."
+          fi
+          echo
+          echo '```'
+          cat "$RUNNER_TEMP/audit-report.txt"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    # Reuse one issue instead of filing a new one every week. Issues are
+    # disabled in some forks, so this degrades to the failed run plus summary.
+    - name: Open or update tracking issue
+      if: steps.audit.outputs.exit_code != '0'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        AUDIT_TITLE: Dependency audit found vulnerabilities
+      run: |
+        if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.has_issues')" != "true" ]; then
+          echo "Issues are disabled for this repository; relying on the failed run and job summary."
+          exit 0
+        fi
+
+        gh label create security \
+          --description "Dependency and supply-chain findings" \
+          --force >/dev/null 2>&1 || true
+
+        {
+          echo "The scheduled dependency audit failed on $(date -u +'%Y-%m-%d %H:%M UTC')."
+          echo
+          echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          echo
+          echo '```'
+          cat "$RUNNER_TEMP/audit-report.txt"
+          echo '```'
+        } > "$RUNNER_TEMP/issue-body.md"
+
+        existing=$(gh issue list \
+          --state open \
+          --search "\"$AUDIT_TITLE\" in:title" \
+          --json number \
+          --jq '.[0].number // empty')
+
+        if [ -n "$existing" ]; then
+          gh issue comment "$existing" --body-file "$RUNNER_TEMP/issue-body.md"
+          echo "Updated existing issue #$existing"
+        else
+          gh issue create \
+            --title "$AUDIT_TITLE" \
+            --label security \
+            --body-file "$RUNNER_TEMP/issue-body.md"
+        fi
+
+    - name: Fail on findings
+      if: steps.audit.outputs.exit_code != '0'
+      run: |
+        echo "::error::cargo audit reported vulnerabilities; see the job summary."
+        exit 1
