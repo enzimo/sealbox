@@ -33,3 +33,6 @@ target/
 
 # Sqlite
 *.db*
+
+# Lists of real values to search for stay outside Git (see CONTRIBUTING.md).
+LOCAL-ONLY*

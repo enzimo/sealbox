@@ -1,0 +1,28 @@
+name: Personal details
+
+# Checks tracked files and the full commit history for personal details.
+# See CONTRIBUTING.md, "Personal details". Findings are printed without their
+# values so the log does not repeat them.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history, and the pull request's own commits rather than
+          # GitHub's temporary merge commit.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Test the checker
+        run: python3 -m unittest discover -s tests -p "test_check_personal_details.py" -v
+      - name: Check tracked files and history
+        run: python3 scripts/check_personal_details.py --redact

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Personal-details checks now come from the shared project template: `scripts/check_personal_details.py` also checks commit identities, commit messages and every line in history; Git hooks in `.githooks/` run it before commits and pushes; the **Personal details** workflow runs it in CI. It replaces `sealbox-server/tests/no_personal_details.rs`. `docs/personal-details-cleanup.md` covers what to do when a detail was already pushed.
+
 ## [0.2.2] - 2026-10-15
 
 ### Changed
