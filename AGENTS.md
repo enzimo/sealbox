@@ -32,7 +32,7 @@ Sealbox is a lightweight, single-node secret storage service built in Rust. It p
 - **Service independence**: Sealbox must not import or encode an upstream application's user, team, or channel model
 
 ### Personal Details
-Never put personal details in tracked files or commit metadata: no real names, handles, assistant names, emails, chat or account IDs, domains, machine or runner names, host paths, or copied chats, emails and logs. Use the placeholders and rules in `CONTRIBUTING.md` ("Personal details"); `scripts/check_personal_details.py` enforces the parts a machine can check. Before the first commit in a clone or worktree, run `git config core.hooksPath .githooks` and check that `git config user.name` and `user.email` match an identity in `.personal-details-allowlist`. Run `python3 scripts/check_personal_details.py` before every push. If a personal detail was already pushed, stop and tell the user; follow `docs/personal-details-cleanup.md` together with them.
+Never put personal details in tracked files or commit metadata: no real names, handles, assistant names, emails, chat or account IDs, domains, machine or runner names, host paths, or copied chats, emails and logs. Use the placeholders and rules in `CONTRIBUTING.md` ("Personal details"); `scripts/check_personal_details.py` enforces the parts a machine can check. Before the first commit in a clone or worktree, run `git config core.hooksPath .githooks` and check that `git config user.email` is a GitHub noreply address. Run `python3 scripts/check_personal_details.py` before every push. If a personal detail was already pushed, stop and tell the user; follow `docs/personal-details-cleanup.md` together with them.
 
 ## Web UI and CLI Collaboration
 
