@@ -34,7 +34,6 @@ uuid = { version = "1.23.2", features = ["v4", "serde"] }
 reqwest = { version = "0.13", features = ["json"] }
 assert_cmd = "2.2"
 tempfile = "3.27"
-regex = "1.13"
 
 # Argon2 is deliberately expensive; unoptimized it makes debug-build backup
 # commands take many seconds at the default cost.
