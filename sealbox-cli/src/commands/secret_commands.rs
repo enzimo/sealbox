@@ -18,10 +18,10 @@ use crate::{
     output::{CleanupExpiredResult, OutputManager},
 };
 
+use super::{input::read_secret_from_tty_or_stdin, secret_archive};
+
 const CLEANUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-
-use super::{input::read_secret_from_tty_or_stdin, secret_archive};
 
 pub struct DecryptedSecret {
     pub key: String,
