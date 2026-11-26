@@ -87,7 +87,7 @@ This covers behavior and intent for command usage. Prefer exact option names fro
 
 1. `sealbox-cli secret set temp/token --ttl 3600`
 2. After duration, expired records remain until read, server startup, or manual cleanup.
-3. Run `sealbox-cli secret cleanup-expired` (or `SEALBOX_TOKEN_FILE=/path/to/tenant_token sealbox-cli secret cleanup-expired --output json` for scripts) to delete all expired secrets, credentials, and files for the calling tenant without needing local key files. `deleted_count` reports removed versions (rows), and the root token is rejected with `401`.
+3. Run `sealbox-cli secret cleanup-expired` (or `SEALBOX_TOKEN_FILE=/path/to/tenant_token sealbox-cli secret cleanup-expired --output json` for scripts) to delete all expired secrets, credentials, and files for the calling tenant without needing local key files. Cleanup removes only expired versions; older versions without expiry stay and the newest of them becomes current. `deleted_count` reports removed versions (rows), and the root token is rejected with `401`.
 
 ### Bulk operations
 

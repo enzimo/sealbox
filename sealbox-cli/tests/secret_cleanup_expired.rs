@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::{Router, http::StatusCode, response::Html, routing::delete};
 use reqwest::Client;
 use rusqlite::Connection;
 use sealbox_server::{config::SealboxConfig, create_app};
@@ -792,4 +793,267 @@ async fn cleanup_expired_exits_1_with_empty_stdout_on_errors() {
         "expected request error on stderr, got: {:?}",
         closed_err.stderr
     );
+}
+
+/// Minimal Axum stub server on its own OS thread for testing non-2xx and
+/// malformed 200 HTTP responses independently of `sealbox-server`.
+struct StubServer {
+    base_url: String,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl StubServer {
+    fn start(app: Router) -> Self {
+        let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let handle = thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build stub server tokio runtime");
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind ephemeral stub port");
+                let addr = listener.local_addr().expect("read stub local addr");
+                addr_tx.send(addr).expect("send stub addr");
+
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .expect("serve stub axum app");
+            });
+        });
+
+        let addr = addr_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive stub listen address");
+
+        Self {
+            base_url: format!("http://{addr}"),
+            shutdown_tx: Some(shutdown_tx),
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for StubServer {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[tokio::test]
+async fn cleanup_expired_exits_1_with_empty_stdout_on_500_and_non_json_200() {
+    let empty_home = tempfile::tempdir().expect("empty home");
+
+    // 1. 500 Internal Server Error exits 1 with empty stdout and status-code stderr prefix.
+    let err_500_server = StubServer::start(Router::new().route(
+        "/v2/cleanup-expired",
+        delete(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "database unavailable") }),
+    ));
+    let err_500 = run_cli(
+        empty_home.path(),
+        &[],
+        &[
+            "--url",
+            err_500_server.base_url.as_str(),
+            "--token",
+            "stub-tenant-token",
+            "secret",
+            "cleanup-expired",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+    assert_eq!(err_500.code, Some(1));
+    assert!(err_500.stdout.is_empty(), "stdout: {:?}", err_500.stdout);
+    assert!(
+        err_500
+            .stderr
+            .starts_with("Error: Server returned error (status code: 500"),
+        "expected 500 error prefix on stderr, got: {:?}",
+        err_500.stderr
+    );
+    assert!(
+        err_500.stderr.contains("database unavailable"),
+        "expected response body on stderr, got: {:?}",
+        err_500.stderr
+    );
+
+    // 2. 200 OK with an HTML body (e.g. proxy error page) exits 1 with empty stdout
+    // and parse-failure stderr prefix.
+    let html_200_server = StubServer::start(Router::new().route(
+        "/v2/cleanup-expired",
+        delete(|| async { Html("<html><body>proxy page</body></html>") }),
+    ));
+    let html_200 = run_cli(
+        empty_home.path(),
+        &[],
+        &[
+            "--url",
+            html_200_server.base_url.as_str(),
+            "--token",
+            "stub-tenant-token",
+            "secret",
+            "cleanup-expired",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+    assert_eq!(html_200.code, Some(1));
+    assert!(html_200.stdout.is_empty(), "stdout: {:?}", html_200.stdout);
+    assert!(
+        html_200
+            .stderr
+            .starts_with("Error: Failed to parse server response"),
+        "expected parse error prefix on stderr, got: {:?}",
+        html_200.stderr
+    );
+}
+
+#[tokio::test]
+async fn cleanup_expired_counts_versions_and_falls_back_to_permanent_version() {
+    let server = LiveServer::start();
+    let (tenant_id, token) = server.create_tenant("Tenant MultiVersion").await;
+    let home = tempfile::tempdir().expect("tenant home");
+    setup_tenant_keys(&server, home.path(), &token).await;
+
+    let envs = [
+        ("SEALBOX_URL", server.base_url.as_str()),
+        ("SEALBOX_TOKEN", token.as_str()),
+    ];
+
+    // Key with permanent v1 and expiring v2: cleanup should remove only v2 so v1 becomes current.
+    run_cli(
+        home.path(),
+        &envs,
+        &["secret", "set", "fallback-key", "permanent-v1"],
+    )
+    .await
+    .assert_success("set fallback-key v1");
+    run_cli(
+        home.path(),
+        &envs,
+        &[
+            "secret",
+            "set",
+            "fallback-key",
+            "ephemeral-v2",
+            "--ttl",
+            "1",
+        ],
+    )
+    .await
+    .assert_success("set fallback-key v2");
+
+    // Key with two expiring versions: both rows should count toward deleted_count.
+    run_cli(
+        home.path(),
+        &envs,
+        &[
+            "secret",
+            "set",
+            "multi-expired-key",
+            "expired-v1",
+            "--ttl",
+            "1",
+        ],
+    )
+    .await
+    .assert_success("set multi-expired-key v1");
+    run_cli(
+        home.path(),
+        &envs,
+        &[
+            "secret",
+            "set",
+            "multi-expired-key",
+            "expired-v2",
+            "--ttl",
+            "1",
+        ],
+    )
+    .await
+    .assert_success("set multi-expired-key v2");
+
+    assert_eq!(server.row_count(&tenant_id, "fallback-key"), 2);
+    assert_eq!(server.row_count(&tenant_id, "multi-expired-key"), 2);
+
+    // Wait past expiry without calling `secret get` first so lazy cleanup cannot mask the result.
+    server
+        .wait_until_expired(&[
+            (&tenant_id, "fallback-key"),
+            (&tenant_id, "multi-expired-key"),
+        ])
+        .await;
+
+    let janitor_home = tempfile::tempdir().expect("janitor home");
+    let cleanup = run_cli(
+        janitor_home.path(),
+        &envs,
+        &["secret", "cleanup-expired", "--output", "json"],
+    )
+    .await;
+    cleanup.assert_success("multi-version cleanup-expired");
+    assert!(
+        cleanup.stderr.is_empty(),
+        "unexpected stderr: {}",
+        cleanup.stderr
+    );
+
+    let (deleted_count, _) = parse_cleanup_json(&cleanup.stdout);
+    assert_eq!(deleted_count, 3);
+    assert_eq!(server.row_count(&tenant_id, "fallback-key"), 1);
+    assert_eq!(server.row_count(&tenant_id, "multi-expired-key"), 0);
+
+    let fallback = run_cli(
+        home.path(),
+        &envs,
+        &["secret", "get", "fallback-key", "--output", "json"],
+    )
+    .await;
+    fallback.assert_success("get fallback-key after cleanup");
+    let fallback_json = parse_secret_get_json(&fallback.stdout);
+    assert_eq!(fallback_json["value"], "permanent-v1");
+    assert_eq!(fallback_json["version"], 1);
+}
+
+#[tokio::test]
+async fn cleanup_expired_ignores_v1_api_version_without_warning() {
+    let server = LiveServer::start();
+    let (_tenant_id, token) = server.create_tenant("Tenant V1Env").await;
+    let empty_home = tempfile::tempdir().expect("empty home");
+
+    let envs = [
+        ("SEALBOX_URL", server.base_url.as_str()),
+        ("SEALBOX_TOKEN", token.as_str()),
+        ("SEALBOX_API_VERSION", "v1"),
+    ];
+
+    let out = run_cli(
+        empty_home.path(),
+        &envs,
+        &["secret", "cleanup-expired", "--output", "json"],
+    )
+    .await;
+    out.assert_success("cleanup-expired with SEALBOX_API_VERSION=v1");
+    assert!(
+        out.stderr.is_empty(),
+        "expected no v1 deprecation warning on stderr, got: {:?}",
+        out.stderr
+    );
+    let (deleted_count, _) = parse_cleanup_json(&out.stdout);
+    assert_eq!(deleted_count, 0);
 }

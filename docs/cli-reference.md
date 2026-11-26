@@ -347,12 +347,12 @@ sealbox-cli secret cleanup-expired [OPTIONS]
 - `--token <token>` - Tenant authentication token (overrides config; prefer `SEALBOX_TOKEN_FILE` in scripts so the token does not appear on the process command line)
 
 **Behavior:**
-- **Scope:** Although nested under `secret`, this removes all expired **secrets, credentials, and files** belonging to the calling tenant (all three are stored in the tenant's secrets table). Unexpired records, records without a TTL, and other tenants' records are untouched.
+- **Scope:** Although nested under `secret`, this removes all expired **secrets, credentials, and files** belonging to the calling tenant (all three are stored in the tenant's secrets table). Cleanup removes only expired versions; older versions without expiry stay and the newest of them becomes current. Unexpired records, records without a TTL, and other tenants' records are untouched.
 - **Count semantics:** `deleted_count` counts deleted **stored versions (rows)**, not distinct keys. For example, a key with three expired versions contributes `3` to `deleted_count`.
 - **Auth and keys:** Requires only the server URL and a **tenant token**; local RSA public/private key files are not read or required. The server root token (`AUTH_TOKEN`) is rejected with HTTP `401`.
 - **Output:** Prints only the formatted cleanup summary to stdout (no extra banner or info lines). With `--output json`, stdout is the pretty-printed server JSON object with `deleted_count` and `cleaned_at` (Unix seconds).
-- **Timeouts and retries:** Uses a 10-second connect timeout and a 60-second total request timeout. If a request times out, the command exits `1` with empty stdout and an error on stderr, and the server outcome is unknown because the server may still finish deleting under its database lock. The operation is idempotent, so re-running is safe; `deleted_count` reports only what that single call removed, not everything removed since the last successful call.
-- **Exit codes:** Exits `0` on success. Runtime failures (missing token, HTTP/auth error such as `401`, network/timeout error, or malformed response) exit `1` with empty stdout and the error message (including the HTTP status code on server errors) on stderr. Usage errors (unknown flag or invalid argument value) exit `2` with empty stdout and usage text on stderr before any request is made.
+- **Timeouts and retries:** Uses a 10-second connect timeout and a 60-second total request timeout. A connect timeout exits `1` (`Failed to request server`) before any request is sent. A request timeout or a stalled response body also exits `1` (`Failed to request server` or `Failed to parse server response`) with empty stdout, leaving the server outcome unknown because the server may have already committed or may still finish deleting under its database lock. The operation is idempotent, so re-running is safe; `deleted_count` reports only what that single call removed, not everything removed since the last successful call.
+- **Exit codes:** Exits `0` on success. Runtime failures (missing token, invalid `--api-version`, HTTP/auth error such as `401`, network/timeout error, or malformed/stalled response body) exit `1` with empty stdout and the error message (including the HTTP status code on server errors) on stderr. Usage errors (unknown flag, extra positional argument, or an invalid `--output` value) exit `2` with empty stdout and usage text on stderr before any request is made. An older `sealbox-cli` binary that predates this subcommand also exits `2` with `unrecognized subcommand` on stderr, which callers can check to detect an older CLI.
 
 **Examples:**
 ```bash
@@ -724,8 +724,8 @@ CLI commands can be configured using environment variables:
 ## Exit Codes
 
 - `0` - Success
-- `1` - Error (authentication, HTTP/server, network/timeout, or file/configuration error; details are written to stderr)
-- `2` - Usage error (unknown flag or invalid argument value; reported before any request is made)
+- `1` - Error (authentication, HTTP/server, network/timeout, or file/configuration error — including an invalid `--api-version` value; details are written to stderr)
+- `2` - Usage error (unknown subcommand such as `unrecognized subcommand` on an older CLI, unknown flag, missing required argument, or an invalid parser-validated option such as `--output`; reported before any request is made)
 
 ## Server Backup Commands
 
