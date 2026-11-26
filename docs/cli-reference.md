@@ -350,9 +350,9 @@ sealbox-cli secret cleanup-expired [OPTIONS]
 - **Scope:** Although nested under `secret`, this removes all expired **secrets, credentials, and files** belonging to the calling tenant (all three are stored in the tenant's secrets table). Unexpired records, records without a TTL, and other tenants' records are untouched.
 - **Count semantics:** `deleted_count` counts deleted **stored versions (rows)**, not distinct keys. For example, a key with three expired versions contributes `3` to `deleted_count`.
 - **Auth and keys:** Requires only the server URL and a **tenant token**; local RSA public/private key files are not read or required. The server root token (`AUTH_TOKEN`) is rejected with HTTP `401`.
-- **Output:** Prints only the formatted cleanup summary to stdout (no extra banner or info lines). With `--output json`, stdout is the exact server JSON object: `{"deleted_count": N, "cleaned_at": T}` (`cleaned_at` is Unix seconds).
+- **Output:** Prints only the formatted cleanup summary to stdout (no extra banner or info lines). With `--output json`, stdout is the pretty-printed server JSON object with `deleted_count` and `cleaned_at` (Unix seconds).
 - **Timeouts and retries:** Uses a 10-second connect timeout and a 60-second total request timeout. If a request times out, the command exits `1` with empty stdout and an error on stderr, and the server outcome is unknown because the server may still finish deleting under its database lock. The operation is idempotent, so re-running is safe; `deleted_count` reports only what that single call removed, not everything removed since the last successful call.
-- **Exit codes:** Exits `0` on success. Any failure (missing token, HTTP/auth error such as `401`, network/timeout error, or malformed response) exits `1` with empty stdout and the error message (including the HTTP status code on server errors) on stderr.
+- **Exit codes:** Exits `0` on success. Runtime failures (missing token, HTTP/auth error such as `401`, network/timeout error, or malformed response) exit `1` with empty stdout and the error message (including the HTTP status code on server errors) on stderr. Usage errors (unknown flag or invalid argument value) exit `2` with empty stdout and usage text on stderr before any request is made.
 
 **Examples:**
 ```bash
@@ -363,7 +363,10 @@ sealbox-cli secret cleanup-expired
 SEALBOX_URL=http://localhost:8080 \
 SEALBOX_TOKEN_FILE=/secure/tenant/token \
 sealbox-cli secret cleanup-expired --output json
-# {"deleted_count": 3, "cleaned_at": 1700000000}
+# {
+#   "deleted_count": 3,
+#   "cleaned_at": 1700000000
+# }
 
 # YAML output
 sealbox-cli secret cleanup-expired --output yaml
@@ -722,6 +725,8 @@ CLI commands can be configured using environment variables:
 
 - `0` - Success
 - `1` - Error (authentication, HTTP/server, network/timeout, or file/configuration error; details are written to stderr)
+- `2` - Usage error (unknown flag or invalid argument value; reported before any request is made)
+
 ## Server Backup Commands
 
 ### `admin backup`
