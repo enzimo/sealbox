@@ -220,7 +220,7 @@ Sealbox supports automatic expiration of secrets using TTL:
 - **Set TTL**: Specify expiration time in seconds when storing secrets
 - **Lazy Cleanup**: Expired secrets are deleted when you try to access them
 - **Startup Cleanup**: Server removes expired secrets when it starts
-- **Manual Cleanup**: Use admin API to batch-remove expired secrets
+- **Manual Cleanup**: Run `sealbox-cli secret cleanup-expired` to batch-remove expired records in your tenant (or call `DELETE /v2/admin/cleanup-expired` with the root token for all tenants)
 
 ### TTL Examples
 ```bash
@@ -268,4 +268,4 @@ Sealbox supports automatic expiration of secrets using TTL:
 ### TTL-Related Issues
 - **Secret disappeared**: It may have expired, check if you set a TTL
 - **Unexpected cleanup**: Server cleans expired secrets on startup
-- **Storage not shrinking**: Use manual cleanup: `curl -X DELETE -H "Authorization: Bearer $TENANT_TOKEN" $URL/v2/cleanup-expired`
+- **Storage not shrinking**: Run manual cleanup for your tenant: `./target/release/sealbox-cli secret cleanup-expired` (or `curl -X DELETE -H "Authorization: Bearer $TENANT_TOKEN" $URL/v2/cleanup-expired`)

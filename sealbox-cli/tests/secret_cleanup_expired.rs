@@ -643,9 +643,22 @@ async fn cleanup_expired_supports_table_yaml_and_config_file() {
         "unexpected stderr: {}",
         table_out.stderr
     );
-    assert!(table_out.stdout.contains("Deleted Count"));
+    let deleted_count_line = table_out
+        .stdout
+        .lines()
+        .find(|line| line.contains("Deleted Count"))
+        .expect("Deleted Count row in table output");
+    let deleted_count_cells: Vec<&str> = deleted_count_line
+        .split(['│', '┆'])
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    assert_eq!(
+        deleted_count_cells,
+        vec!["Deleted Count", "0"],
+        "unexpected Deleted Count row: {deleted_count_line}"
+    );
     assert!(table_out.stdout.contains("Cleaned At"));
-    assert!(table_out.stdout.contains('0'));
 
     let yaml_out = run_cli(
         home.path(),

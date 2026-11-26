@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `sealbox-cli secret cleanup-expired`: calls `DELETE /v2/cleanup-expired` with a tenant token (no local RSA key files required) to delete expired secrets, credentials, and files for the calling tenant. Supports `table` (default), `json` (exact `{"deleted_count": N, "cleaned_at": T}` server shape with no extra stdout lines), and `yaml` outputs, with 10 s connect and 60 s request timeouts.
+
 ### Changed
 - Personal-details checks now come from the shared project template: `scripts/check_personal_details.py` also checks commit identities, commit messages and every line in history; Git hooks in `.githooks/` run it before commits and pushes; the **Personal details** workflow runs it in CI. It replaces `sealbox-server/tests/no_personal_details.rs`. `docs/personal-details-cleanup.md` covers what to do when a detail was already pushed.
 

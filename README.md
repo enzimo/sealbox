@@ -86,6 +86,9 @@ credential, and it is only used to create tenants and issue their tokens.
 # Retrieve a secret
 ./target/release/sealbox-cli secret get mypassword
 
+# Remove expired secrets, credentials, and files for the current tenant
+./target/release/sealbox-cli secret cleanup-expired --output json
+
 # Generate a strong password locally
 ./target/release/sealbox-cli password generate --length 32
 
@@ -544,7 +547,7 @@ DELETE /v2/cleanup-expired
 - **TTL**: Time-to-live in seconds from creation time
 - **Lazy Cleanup**: Expired secrets are deleted when accessed, not immediately when they expire
 - **Startup Cleanup**: Server removes expired secrets on startup
-- **Manual Cleanup**: `DELETE /v2/cleanup-expired` (one tenant) or `DELETE /v2/admin/cleanup-expired` (all tenants, root token)
+- **Manual Cleanup**: `sealbox-cli secret cleanup-expired` / `DELETE /v2/cleanup-expired` (one tenant) or `DELETE /v2/admin/cleanup-expired` (all tenants, root token, API-only)
 
 ### Key Management
 ```bash

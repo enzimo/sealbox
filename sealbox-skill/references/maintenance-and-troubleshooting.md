@@ -13,8 +13,11 @@
 
 - Startup performs cleanup of expired entries.
 - Expired values are also enforced on read.
-- Manual cleanup endpoint:
-  - `POST /v1/admin/cleanup-expired`
+- Tenant-scoped manual cleanup (CLI or API, tenant token only; root token returns `401`):
+  - `sealbox-cli secret cleanup-expired [--output table|json|yaml]` (calls `DELETE /v2/cleanup-expired`; removes expired secrets, credentials, and files for that tenant without requiring local key files; `deleted_count` counts removed versions/rows).
+  - For scripts, prefer `SEALBOX_TOKEN_FILE` and `--output json`. The CLI uses a 10 s connect timeout and 60 s total timeout; a timeout exits `1` with unknown server outcome and is safe to retry.
+- All-tenant manual cleanup (API-only, root token):
+  - `DELETE /v2/admin/cleanup-expired`
 - TTL checks are deterministic from creation timestamp + TTL seconds.
 
 ## Migrations and compatibility
