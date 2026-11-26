@@ -252,6 +252,8 @@ enum SecretCommands {
         /// Secret key name
         key: String,
     },
+    /// Delete expired secrets, credentials, and files for the current tenant
+    CleanupExpired,
     /// Import secrets from an encrypted Sealbox archive
     ///
     /// Key-protected archives are decrypted with the private key they were
@@ -671,6 +673,40 @@ mod tests {
             }
             _ => panic!("Expected secret delete command"),
         }
+    }
+
+    #[test]
+    fn test_parse_secret_cleanup_expired() {
+        let cli = Cli::try_parse_from(["sealbox", "secret", "cleanup-expired"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Secret {
+                command: SecretCommands::CleanupExpired,
+            }
+        ));
+        assert!(cli.output.is_none());
+
+        let cli = Cli::try_parse_from([
+            "sealbox",
+            "secret",
+            "cleanup-expired",
+            "--output",
+            "json",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "tenant-token",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Secret {
+                command: SecretCommands::CleanupExpired,
+            }
+        ));
+        assert!(matches!(cli.output, Some(OutputFormatArg::Json)));
+        assert_eq!(cli.url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(cli.token.as_deref(), Some("tenant-token"));
     }
 
     #[test]

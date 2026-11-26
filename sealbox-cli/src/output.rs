@@ -1,7 +1,14 @@
 use crate::config::OutputFormat;
 use anyhow::Result;
 use comfy_table::{Table, presets::UTF8_FULL};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupExpiredResult {
+    pub deleted_count: usize,
+    pub cleaned_at: i64,
+}
 
 pub struct OutputManager {
     format: OutputFormat,
@@ -148,6 +155,32 @@ impl OutputManager {
                 println!("{table}");
             }
         }
+        Ok(())
+    }
+
+    pub fn format_cleanup_expired(&self, result: &CleanupExpiredResult) -> Result<String> {
+        match self.format {
+            OutputFormat::Json => Ok(serde_json::to_string_pretty(result)?),
+            OutputFormat::Yaml => Ok(format!(
+                "deleted_count: {}\ncleaned_at: {}",
+                result.deleted_count, result.cleaned_at
+            )),
+            OutputFormat::Table => {
+                let mut table = Table::new();
+                table.load_style(UTF8_FULL);
+                table.set_header(vec!["Property", "Value"]);
+                table.add_row(vec!["Deleted Count", &result.deleted_count.to_string()]);
+                table.add_row(vec![
+                    "Cleaned At",
+                    &Self::format_timestamp(result.cleaned_at),
+                ]);
+                Ok(table.to_string())
+            }
+        }
+    }
+
+    pub fn print_cleanup_expired(&self, result: &CleanupExpiredResult) -> Result<()> {
+        println!("{}", self.format_cleanup_expired(result)?);
         Ok(())
     }
 
@@ -320,5 +353,55 @@ mod tests {
         assert_eq!(output.value_to_string(&json!(42)), "42");
         assert_eq!(output.value_to_string(&json!(true)), "true");
         assert_eq!(output.value_to_string(&json!(null)), "null");
+    }
+
+    #[test]
+    fn test_format_cleanup_expired_json() {
+        let output = OutputManager::new(OutputFormat::Json);
+        let result = CleanupExpiredResult {
+            deleted_count: 3,
+            cleaned_at: 1_703_876_543,
+        };
+
+        let formatted = output.format_cleanup_expired(&result).unwrap();
+        let parsed: Value = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "deleted_count": 3,
+                "cleaned_at": 1_703_876_543
+            })
+        );
+        let round_trip: CleanupExpiredResult = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(round_trip, result);
+    }
+
+    #[test]
+    fn test_format_cleanup_expired_yaml() {
+        let output = OutputManager::new(OutputFormat::Yaml);
+        let result = CleanupExpiredResult {
+            deleted_count: 0,
+            cleaned_at: 1_703_876_543,
+        };
+
+        let formatted = output.format_cleanup_expired(&result).unwrap();
+        assert_eq!(formatted, "deleted_count: 0\ncleaned_at: 1703876543");
+    }
+
+    #[test]
+    fn test_format_cleanup_expired_table() {
+        let output = OutputManager::new(OutputFormat::Table);
+        let result = CleanupExpiredResult {
+            deleted_count: 42,
+            cleaned_at: 1_703_876_543,
+        };
+
+        let formatted = output.format_cleanup_expired(&result).unwrap();
+        assert!(formatted.contains("Property"));
+        assert!(formatted.contains("Value"));
+        assert!(formatted.contains("Deleted Count"));
+        assert!(formatted.contains("42"));
+        assert!(formatted.contains("Cleaned At"));
+        assert!(formatted.contains(&OutputManager::format_timestamp(1_703_876_543)));
     }
 }

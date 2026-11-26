@@ -10,8 +10,16 @@ use sealbox_server::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::str::FromStr;
+use std::time::Duration;
 
-use crate::{SecretCommands, config::Config, output::OutputManager};
+use crate::{
+    SecretCommands,
+    config::Config,
+    output::{CleanupExpiredResult, OutputManager},
+};
+
+const CLEANUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const CLEANUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 use super::{input::read_secret_from_tty_or_stdin, secret_archive};
 
@@ -52,6 +60,7 @@ pub async fn handle_command(command: SecretCommands, config: &Config) -> Result<
         }
         SecretCommands::List => list_secrets(config, &output).await,
         SecretCommands::History { key } => get_secret_history(config, &output, key).await,
+        SecretCommands::CleanupExpired => cleanup_expired(config, &output).await,
         SecretCommands::Import {
             file,
             format,
@@ -539,6 +548,50 @@ async fn get_secret_history(config: &Config, output: &OutputManager, key: String
     Ok(())
 }
 
+/// Remove expired records (secrets, credentials, and files) for the caller's tenant.
+///
+/// Calls `DELETE /v2/cleanup-expired` without requiring local RSA key files, and
+/// prints only the structured response to stdout so `--output json` is machine-readable.
+async fn cleanup_expired(config: &Config, output: &OutputManager) -> Result<()> {
+    config
+        .validate()
+        .context("Configuration validation failed")?;
+
+    let client = Client::builder()
+        .connect_timeout(CLEANUP_CONNECT_TIMEOUT)
+        .timeout(CLEANUP_REQUEST_TIMEOUT)
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    let response = client
+        .delete(config.v2_url("cleanup-expired"))
+        .bearer_auth(&config.server.token)
+        .send()
+        .await
+        .context("Failed to request server")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unable to get error information".to_string());
+        anyhow::bail!(
+            "Server returned error (status code: {}):\n{}",
+            status,
+            error_body
+        );
+    }
+
+    let result: CleanupExpiredResult = response
+        .json()
+        .await
+        .context("Failed to parse server response")?;
+
+    output.print_cleanup_expired(&result)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +647,22 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("private key file"));
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_requires_token() {
+        let (mut config, _temp_dir) = create_test_config();
+        config.server.token.clear();
+        let output = OutputManager::new(OutputFormat::Json);
+
+        let result = cleanup_expired(&config, &output).await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Configuration validation failed")
+        );
     }
 }
