@@ -16,6 +16,7 @@ Sealbox supports encrypted bulk operations for backup and migration through CLI 
 - Loads a compatible archive into current server context.
 - Can restore encrypted versions and metadata according to import format.
 - Requires appropriate target key material and endpoint compatibility.
+- Applies the whole-key expiry rule: if a key's newest archived version has expired (`expires_at < now`), every archived version of that key is skipped so superseded older versions are never revived. Under an unexpired newest archived version, individual expired older versions are still skipped.
 
 ## Supported archive formats
 

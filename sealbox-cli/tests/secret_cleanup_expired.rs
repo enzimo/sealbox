@@ -1212,7 +1212,15 @@ async fn read_and_import_do_not_revive_expired_newest_version() {
         ("SEALBOX_TOKEN", token_b.as_str()),
     ];
 
-    // Permanent v1 + 2-second TTL v2, plus a permanent control key.
+    // Permanent control key, plus permanent v1 + expiring v2 for ephemeral-override.
+    // Create still-active first so only the single export command runs inside v2's TTL window.
+    run_cli(
+        home_a.path(),
+        &envs_a,
+        &["secret", "set", "still-active", "keep-me"],
+    )
+    .await
+    .assert_success("set still-active");
     run_cli(
         home_a.path(),
         &envs_a,
@@ -1229,24 +1237,17 @@ async fn read_and_import_do_not_revive_expired_newest_version() {
             "ephemeral-override",
             "temp-v2",
             "--ttl",
-            "2",
+            "4",
         ],
     )
     .await
     .assert_success("set ephemeral-override v2");
-    run_cli(
-        home_a.path(),
-        &envs_a,
-        &["secret", "set", "still-active", "keep-me"],
-    )
-    .await
-    .assert_success("set still-active");
 
-    // Export --all-versions while v2 is still valid.
+    // Export --all-versions while v2 is still valid and verify all 3 versions were archived.
     let archive_path = home_a.path().join("backup.sealbox");
     let passphrase_file = home_a.path().join("passphrase.txt");
     fs::write(&passphrase_file, "test-archive-passphrase\n").expect("write passphrase");
-    run_cli(
+    let export_out = run_cli(
         home_a.path(),
         &envs_a,
         &[
@@ -1258,8 +1259,15 @@ async fn read_and_import_do_not_revive_expired_newest_version() {
             passphrase_file.to_str().unwrap(),
         ],
     )
-    .await
-    .assert_success("export --all-versions before expiry");
+    .await;
+    export_out.assert_success("export --all-versions before expiry");
+    assert!(
+        export_out
+            .stdout
+            .contains("Exported 3 secret versions across 2 keys"),
+        "expected archive to contain both versions of ephemeral-override plus still-active, got:\n{}",
+        export_out.stdout
+    );
 
     // Wait until ephemeral-override v2 has expired.
     server
@@ -1296,6 +1304,25 @@ async fn read_and_import_do_not_revive_expired_newest_version() {
     )
     .await;
     import_out.assert_success("import pre-expiry archive after expiry");
+    assert!(
+        import_out
+            .stdout
+            .contains("Skipping expired secret 'ephemeral-override'"),
+        "expected import warning for ephemeral-override, got:\n{}",
+        import_out.stdout
+    );
+    assert!(
+        import_out.stdout.contains("2 version(s) skipped"),
+        "expected import warning to report 2 skipped versions, got:\n{}",
+        import_out.stdout
+    );
+    assert!(
+        import_out
+            .stdout
+            .contains("Imported: 1, skipped expired: 2"),
+        "expected import summary to report 1 imported and 2 skipped, got:\n{}",
+        import_out.stdout
+    );
     assert_eq!(server.row_count(&tenant_b, "ephemeral-override"), 0);
     assert_eq!(server.row_count(&tenant_b, "still-active"), 1);
 

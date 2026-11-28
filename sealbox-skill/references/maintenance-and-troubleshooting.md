@@ -11,14 +11,17 @@
 
 ## Expiration cleanup
 
-- Startup performs cleanup of expired entries.
-- Expired values are also enforced on read.
+- **Whole-key expiry rule:** A key's expiry is decided by its newest version (highest version number). A value written with a TTL replaces the key's value until it expires; once that newest version passes `expires_at`, the whole key is treated as gone (reads by key or older version return `404` and delete all versions; listings and history omit the key; deleting a single version of an already-expired key deletes all versions and returns `404`). Silently reviving a superseded value is unsafe for credentials.
+- **Expired older versions:** An expired older version under a newer, unexpired version is still removed on its own while the active key stays intact.
+- Startup performs cleanup of expired keys (all versions) and expired older versions.
+- Expired keys and expired older versions are also enforced and deleted on read.
 - Tenant-scoped manual cleanup (CLI or API, tenant token only; root token returns `401`):
-  - `sealbox-cli secret cleanup-expired [--output table|json|yaml]` (calls `DELETE /v2/cleanup-expired`; removes only expired versions of secrets, credentials, and files for that tenant without requiring local key files; older versions without expiry stay and the newest of them becomes current; `deleted_count` counts removed versions/rows).
+  - `sealbox-cli secret cleanup-expired [--output table|json|yaml]` (calls `DELETE /v2/cleanup-expired`; removes every version of expired secrets, credentials, and files for that tenant plus expired older versions under active keys, without requiring local key files; `deleted_count` counts every removed version row).
   - For scripts, prefer `SEALBOX_TOKEN_FILE` and `--output json`. The CLI uses a 10 s connect timeout (nothing sent) and 60 s total timeout; a request or response-body timeout exits `1` with unknown server outcome and is safe to retry. Older CLIs without this subcommand exit `2` with `unrecognized subcommand`.
 - All-tenant manual cleanup (API-only, root token):
-  - `DELETE /v2/admin/cleanup-expired`
-- TTL checks are deterministic from creation timestamp + TTL seconds.
+  - `DELETE /v2/admin/cleanup-expired` (removes every version of expired keys plus expired older versions across all tenants; `deleted_count` counts every removed version row).
+- Master key rotation cleans up expired entries before listing secrets to rewrap and before committing rotation, and drops (with a warning log) updates for rows that expired between fetch and rotate.
+- TTL checks are deterministic from creation timestamp + TTL seconds (`expires_at < now`).
 
 ## Migrations and compatibility
 

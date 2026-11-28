@@ -164,6 +164,8 @@ sealbox-cli key rotate [OPTIONS]
 - `--url <url>` - Server URL (overrides config)
 - `--token <token>` - Authentication token (overrides config)
 
+**Expiry handling during rotation:** Before listing secrets to rewrap and before committing the rotation, the server cleans up expired keys and expired older versions in the tenant. If a row expires and is removed between fetching secrets and submitting the rewrapped data keys, rotation accepts and drops that update (logging a warning on the server) instead of failing; unexpected updates for rows that still exist are rejected.
+
 ### `key export`
 
 Back up the local key pair to a passphrase-encrypted bundle. The server only
@@ -227,9 +229,10 @@ sealbox-cli secret set <key> [value] [OPTIONS]
 - `--token <token>` - Authentication token (overrides config)
 
 **TTL Behavior:**
-- Expired secrets are automatically deleted when accessed (lazy cleanup)
-- Server also cleans expired secrets on startup
-- Use `sealbox-cli secret cleanup-expired` for immediate batch removal in your tenant (or `DELETE /v2/admin/cleanup-expired` for all tenants)
+- A key's expiry is decided by its newest version (highest version number). A value written with a TTL replaces the key until it expires; once that newest version passes `expires_at`, the whole key is treated as gone rather than silently reviving an older, superseded version (which is unsafe for credentials).
+- Saving a new value to an already-expired key clears its expired versions first in the same transaction and starts fresh at version `1`, so older versions are never revived.
+- An expired older version under a newer, unexpired version is still removed on its own while keeping the active key intact.
+- Expired keys (all versions) and expired older versions are deleted when accessed (lazy cleanup), on server startup, or via `sealbox-cli secret cleanup-expired` (per tenant) / `DELETE /v2/admin/cleanup-expired` (all tenants).
 
 **Examples:**
 ```bash
@@ -266,7 +269,8 @@ sealbox-cli secret get <key> [OPTIONS]
 - `--token <token>` - Authentication token (overrides config)
 
 **TTL Behavior:**
-- If the secret has expired, it will be automatically deleted and you'll get a "Secret not found" error
+- If the key's newest version has expired, all versions of the key are deleted and you get a "Secret not found" (`404`) error—both when reading the latest version and when requesting an older `--version`
+- If only an older version has expired while a newer version is still valid, the expired older version is deleted on its own and the active key remains readable
 - This is the lazy cleanup mechanism in action
 
 **Examples:**
@@ -283,7 +287,7 @@ sealbox-cli secret get expired_token
 
 ### `secret list`
 
-List all your secrets (metadata only, no values).
+List all active secrets (metadata only, no values). Keys whose newest version has expired are omitted.
 
 ```bash
 sealbox-cli secret list [OPTIONS]
@@ -295,7 +299,7 @@ sealbox-cli secret list [OPTIONS]
 
 ### `secret history`
 
-List retained version metadata for one secret. Secret values and encrypted payload bytes are not returned.
+List retained version metadata for one active secret. Secret values and encrypted payload bytes are not returned. Returns not found (`404`) if the key's newest version has expired; expired older versions under an unexpired newest version are omitted.
 
 ```bash
 sealbox-cli secret history <key> [OPTIONS]
@@ -310,7 +314,7 @@ sealbox-cli secret history <key> [OPTIONS]
 
 ### `secret delete`
 
-Delete a secret and all stored versions by default, or delete one specific version.
+Delete a secret and all stored versions by default, or delete one specific version. Deleting a specific version of a key whose newest version has already expired removes all versions of the key and returns not found (`404`).
 
 ```bash
 sealbox-cli secret delete <key> [OPTIONS]
@@ -347,8 +351,8 @@ sealbox-cli secret cleanup-expired [OPTIONS]
 - `--token <token>` - Tenant authentication token (overrides config; prefer `SEALBOX_TOKEN_FILE` in scripts so the token does not appear on the process command line)
 
 **Behavior:**
-- **Scope:** Although nested under `secret`, this removes all expired **secrets, credentials, and files** belonging to the calling tenant (all three are stored in the tenant's secrets table). Cleanup removes only expired versions; older versions without expiry stay and the newest of them becomes current. Unexpired records, records without a TTL, and other tenants' records are untouched.
-- **Count semantics:** `deleted_count` counts deleted **stored versions (rows)**, not distinct keys. For example, a key with three expired versions contributes `3` to `deleted_count`.
+- **Scope:** Although nested under `secret`, this removes all expired **secrets, credentials, and files** belonging to the calling tenant (all three are stored in the tenant's secrets table). A key's expiry is decided by its newest version: when the newest version has expired, cleanup removes **every version** of that key (including older permanent versions) so superseded values are never revived. Under an unexpired newest version, expired older versions are still removed on their own while the active key stays intact. Unexpired keys with no expired older versions, permanent keys, and other tenants' records are untouched.
+- **Count semantics:** `deleted_count` counts every deleted **stored version (row)**, not distinct keys. For example, an expired key with a permanent v1 and an expired v2 contributes `2` to `deleted_count`, and an active key with one expired older version contributes `1`.
 - **Auth and keys:** Requires only the server URL and a **tenant token**; local RSA public/private key files are not read or required. The server root token (`AUTH_TOKEN`) is rejected with HTTP `401`.
 - **Output:** Prints only the formatted cleanup summary to stdout (no extra banner or info lines). With `--output json`, stdout is the pretty-printed server JSON object with `deleted_count` and `cleaned_at` (Unix seconds).
 - **Timeouts and retries:** Uses a 10-second connect timeout and a 60-second total request timeout. A connect timeout exits `1` (`Failed to request server`) before any request is sent. A request timeout or a stalled response body also exits `1` (`Failed to request server` or `Failed to parse server response`) with empty stdout, leaving the server outcome unknown because the server may have already committed or may still finish deleting under its database lock. The operation is idempotent, so re-running is safe; `deleted_count` reports only what that single call removed, not everything removed since the last successful call.
@@ -443,7 +447,7 @@ sealbox-cli secret import <file> [OPTIONS]
 - Imports versions oldest first per key, so the newest exported version becomes current; version numbers restart on the target server and retention limits apply (files keep 3, credentials 10)
 - Imported records are added as new versions on top of any existing key with the same name
 - Plaintext metadata is preserved
-- Future `expires_at` values are converted back into TTL seconds; already expired records are skipped
+- Future `expires_at` values are converted back into TTL seconds; if a key's newest archived version has already expired, `secret import` skips **every archived version** of that key so older superseded versions are never revived. Under an unexpired newest archived version, individual expired older versions are still skipped.
 
 **Example: restore onto a new server that already has its own key pair**
 ```bash
@@ -591,13 +595,14 @@ sealbox-cli credential delete db/postgres
 
 ### TTL (Time-To-Live) Overview
 
-TTL allows secrets to automatically expire and be deleted:
+TTL allows secrets, credentials, and files to automatically expire and be deleted:
 
 **How it works:**
-- Set TTL in seconds when storing secrets with `--ttl <seconds>`
-- Expired secrets are deleted when accessed (lazy cleanup)
-- Server cleans expired secrets on startup
-- Manual cleanup is available per tenant via `sealbox-cli secret cleanup-expired` (or `DELETE /v2/cleanup-expired`) and across all tenants via the root admin API (`DELETE /v2/admin/cleanup-expired`)
+- Set TTL in seconds when storing values with `--ttl <seconds>`
+- **Whole-key expiry rule:** A key's expiry is decided by its newest version (highest version number). A value written with a TTL replaces the key's value until it expires; afterwards the key does not exist—reads by key or by older version delete all versions and return `404`, and listings and version history omit it. Silently reviving a superseded value when a temporary value expires is unsafe for credentials.
+- **Expired older versions:** An expired older version under a newer, unexpired version is still removed on its own while the active key remains readable.
+- Expired keys (all versions) and expired older versions are deleted when accessed (lazy cleanup) and on server startup
+- Manual cleanup is available per tenant via `sealbox-cli secret cleanup-expired` (or `DELETE /v2/cleanup-expired`) and across all tenants via the root admin API (`DELETE /v2/admin/cleanup-expired`); `deleted_count` counts every removed version row
 
 **Use cases:**
 - **Temporary tokens**: API keys that should expire quickly
@@ -607,7 +612,7 @@ TTL allows secrets to automatically expire and be deleted:
 
 ### Manual Cleanup
 
-For a single tenant, run `sealbox-cli secret cleanup-expired` with a tenant token (no local key files required). It removes all expired secrets, credentials, and files in that tenant, counts deleted stored versions (rows), and rejects the root token with HTTP `401`. For scripts, pass the token through `SEALBOX_TOKEN_FILE` instead of `--token`:
+For a single tenant, run `sealbox-cli secret cleanup-expired` with a tenant token (no local key files required). It removes every version of expired secrets, credentials, and files in that tenant plus expired older versions under active keys, counts every deleted stored version (row) in `deleted_count`, and rejects the root token with HTTP `401`. For scripts, pass the token through `SEALBOX_TOKEN_FILE` instead of `--token`:
 
 ```bash
 # Expired records in your tenant (tenant token, table output)

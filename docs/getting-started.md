@@ -214,12 +214,14 @@ Archive export/import is also client-side encrypted. The exported file contains 
 
 ## TTL (Time-To-Live) Features
 
-Sealbox supports automatic expiration of secrets using TTL:
+Sealbox supports automatic expiration of secrets, credentials, and files using TTL:
 
 ### How TTL Works
-- **Set TTL**: Specify expiration time in seconds when storing secrets
-- **Lazy Cleanup**: Expired secrets are deleted when you try to access them
-- **Startup Cleanup**: Server removes expired secrets when it starts
+- **Set TTL**: Specify expiration time in seconds when storing a value
+- **Whole-Key Expiry**: A key's expiry is decided by its newest version. A value written with a TTL replaces the key's value until it expires; once that newest version passes `expires_at`, the whole key is treated as gone (reads by key or older version return not found, listings and history omit it, and all versions are deleted). Silently reviving a superseded older value would be unsafe for credentials.
+- **Expired Older Versions**: If an older version expires while a newer version is still valid (or permanent), only the expired older version is removed; the key stays readable.
+- **Lazy Cleanup**: Expired keys and expired older versions are deleted when accessed
+- **Startup Cleanup**: Server removes expired keys and expired older versions when it starts
 - **Manual Cleanup**: Run `sealbox-cli secret cleanup-expired` to batch-remove expired records in your tenant (or call `DELETE /v2/admin/cleanup-expired` with the root token for all tenants)
 
 ### TTL Examples
@@ -235,8 +237,9 @@ Sealbox supports automatic expiration of secrets using TTL:
 ```
 
 ### TTL Behavior Notes
-- **Not Real-Time**: Expired secrets aren't deleted immediately when they expire
-- **Access-Triggered**: Deletion happens when you try to retrieve the expired secret
+- **Not Real-Time**: Expired rows aren't deleted from SQLite until accessed, cleaned up manually, or removed on startup (though listings and version history omit expired keys immediately)
+- **No Fallback to Older Versions**: Overwriting a permanent key with a TTL-limited value ends the entire key when that newest version expires
+- **Access-Triggered**: Deletion happens when you try to retrieve the expired key (by key or by older version)
 - **Automatic**: No manual intervention needed for cleanup
 - **Storage Efficient**: Expired data is eventually removed from disk
 
@@ -266,6 +269,6 @@ Sealbox supports automatic expiration of secrets using TTL:
 - Re-initialize if needed: `./target/release/sealbox-cli config init --force`
 
 ### TTL-Related Issues
-- **Secret disappeared**: It may have expired, check if you set a TTL
-- **Unexpected cleanup**: Server cleans expired secrets on startup
+- **Secret disappeared**: It may have expired — check if the newest version had a TTL (when the newest version expires, the whole key is removed and does not fall back to earlier versions)
+- **Unexpected cleanup**: Server cleans expired keys and expired older versions on startup
 - **Storage not shrinking**: Run manual cleanup for your tenant: `./target/release/sealbox-cli secret cleanup-expired` (or `curl -X DELETE -H "Authorization: Bearer $TENANT_TOKEN" $URL/v2/cleanup-expired`)

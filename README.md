@@ -373,7 +373,7 @@ docker run --rm \
   sealbox-cli secret export /backups/sealbox-export.json
 ```
 
-Import decrypts the archive locally, migrates supported old archive formats, and writes each record through the normal client-side encrypted save path.
+Import decrypts the archive locally, migrates supported old archive formats, skips expired records (including every version of a key whose newest archived version has expired), and writes each active record through the normal client-side encrypted save path.
 
 ```bash
 docker run --rm \
@@ -545,9 +545,10 @@ DELETE /v2/cleanup-expired
 
 ### TTL Behavior
 - **TTL**: Time-to-live in seconds from creation time
-- **Lazy Cleanup**: Expired secrets are deleted when accessed, not immediately when they expire
-- **Startup Cleanup**: Server removes expired secrets on startup
-- **Manual Cleanup**: `sealbox-cli secret cleanup-expired` / `DELETE /v2/cleanup-expired` (one tenant) or `DELETE /v2/admin/cleanup-expired` (all tenants, root token, API-only)
+- **Whole-Key Expiry**: A key's expiry is decided by its newest version. A value written with a TTL replaces the key until it expires; afterwards the whole key is gone (reads by key or older version return `404` and delete all versions, and listings and history omit the key) instead of silently reviving a superseded older value, which would be unsafe for credentials. An expired older version under a newer, unexpired version is still removed on its own.
+- **Lazy Cleanup**: Expired keys (all versions) and expired older versions are deleted when accessed, not immediately when they expire
+- **Startup Cleanup**: Server removes expired keys and expired older versions on startup
+- **Manual Cleanup**: `sealbox-cli secret cleanup-expired` / `DELETE /v2/cleanup-expired` (one tenant) or `DELETE /v2/admin/cleanup-expired` (all tenants, root token, API-only); `deleted_count` counts every removed version row
 
 ### Key Management
 ```bash
