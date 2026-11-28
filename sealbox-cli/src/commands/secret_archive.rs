@@ -291,7 +291,7 @@ pub async fn import_secrets(
         output,
         || passphrase::read_passphrase(output, passphrase_file.as_deref(), false),
     )?;
-    let mut records = read_archive_tar(&tar_bytes)?;
+    let records = read_archive_tar(&tar_bytes)?;
 
     // New secrets are encrypted to this server's active key, not the key the
     // archive was exported with, so fail before writing anything if none.
@@ -304,30 +304,17 @@ pub async fn import_secrets(
         active_key.id
     ));
 
-    // Oldest first per key, so the newest imported version becomes current.
-    records.sort_by(|left, right| {
-        left.key
-            .cmp(&right.key)
-            .then(left.version.cmp(&right.version))
-    });
-
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let mut imported_count = 0usize;
-    let mut skipped_count = 0usize;
+    let plan = prepare_records_for_import(records, now);
+    for warning in &plan.warnings {
+        output.print_warning(warning);
+    }
 
-    for record in records {
-        let ttl = match record.expires_at {
-            Some(expires_at) if expires_at <= now => {
-                skipped_count += 1;
-                output.print_warning(&format!(
-                    "Skipping expired secret '{}' version {}",
-                    record.key, record.version
-                ));
-                continue;
-            }
-            Some(expires_at) => Some(expires_at - now),
-            None => None,
-        };
+    let mut imported_count = 0usize;
+    let skipped_count = plan.skipped_count;
+
+    for record in plan.records {
+        let ttl = record.expires_at.map(|expires_at| expires_at - now);
         let value = BASE64.decode(&record.value_b64).with_context(|| {
             format!(
                 "Invalid value encoding for '{}' version {}",
@@ -364,6 +351,68 @@ pub async fn import_secrets(
     }))?;
 
     Ok(())
+}
+
+struct PreparedImportPlan {
+    records: Vec<ExportSecretRecordV2>,
+    skipped_count: usize,
+    warnings: Vec<String>,
+}
+
+/// Sort archive records by `(key, version)` and apply the server's expiry rule:
+/// when a key's highest archived version has expired (`expires_at < now`), skip
+/// every archived version of that key so older superseded versions are never
+/// revived on import. Active keys still skip individual expired older versions.
+fn prepare_records_for_import(
+    mut records: Vec<ExportSecretRecordV2>,
+    now: i64,
+) -> PreparedImportPlan {
+    // Oldest first per key, so the newest imported version becomes current.
+    records.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then(left.version.cmp(&right.version))
+    });
+
+    let mut active = Vec::with_capacity(records.len());
+    let mut skipped_count = 0usize;
+    let mut warnings = Vec::new();
+
+    let mut iter = records.into_iter().peekable();
+    while let Some(first) = iter.next() {
+        let mut group = vec![first];
+        while iter.peek().is_some_and(|next| next.key == group[0].key) {
+            group.push(iter.next().expect("peeked element exists"));
+        }
+        let latest = group.last().expect("group is non-empty");
+        if latest.expires_at.is_some_and(|expires_at| expires_at < now) {
+            skipped_count += group.len();
+            warnings.push(format!(
+                "Skipping expired secret '{}' (newest archived version {} expired; {} version(s) skipped)",
+                latest.key,
+                latest.version,
+                group.len()
+            ));
+        } else {
+            for record in group {
+                if record.expires_at.is_some_and(|expires_at| expires_at < now) {
+                    skipped_count += 1;
+                    warnings.push(format!(
+                        "Skipping expired secret '{}' version {}",
+                        record.key, record.version
+                    ));
+                } else {
+                    active.push(record);
+                }
+            }
+        }
+    }
+
+    PreparedImportPlan {
+        records: active,
+        skipped_count,
+        warnings,
+    }
 }
 
 async fn fetch_secret_infos(config: &Config) -> Result<Vec<SecretInfo>> {
@@ -1005,5 +1054,63 @@ mod tests {
 
         assert!(result.unwrap_err().to_string().contains("--force"));
         assert_eq!(fs::read_to_string(&archive).unwrap(), "existing");
+    }
+
+    #[test]
+    fn test_prepare_import_skips_whole_key_when_newest_version_expired_and_keeps_active_keys() {
+        let now = 2_000_000_000i64;
+        let record = |key: &str, version: i32, expires_at: Option<i64>| ExportSecretRecordV2 {
+            key: key.to_string(),
+            version,
+            value_b64: BASE64.encode(format!("{key}-v{version}")),
+            created_at: Some(now - 100),
+            expires_at,
+            metadata: None,
+        };
+
+        let records = vec![
+            // Unsorted: v2 expired over permanent v1 -> whole key skipped with 1 warning.
+            record("ended-key", 2, Some(now - 1)),
+            record("ended-key", 1, None),
+            // Active key with expired older v1 and permanent v2 -> only v1 skipped.
+            record("active-perm", 2, None),
+            record("active-perm", 1, Some(now - 10)),
+            // Active key with expired older v1 and future v2 -> only v1 skipped.
+            record("active-ttl", 1, Some(now - 5)),
+            record("active-ttl", 2, Some(now + 60)),
+            // Exact boundary expires_at == now matches server `< now` (not expired).
+            record("boundary-key", 1, None),
+            record("boundary-key", 2, Some(now)),
+        ];
+
+        let plan = prepare_records_for_import(records, now);
+
+        let kept: Vec<(&str, i32)> = plan
+            .records
+            .iter()
+            .map(|r| (r.key.as_str(), r.version))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("active-perm", 2),
+                ("active-ttl", 2),
+                ("boundary-key", 1),
+                ("boundary-key", 2),
+            ]
+        );
+        // 2 skipped from ended-key + 1 from active-perm + 1 from active-ttl.
+        assert_eq!(plan.skipped_count, 4);
+        // 1 warning for ended-key (whole key) + 1 for active-perm v1 + 1 for active-ttl v1.
+        assert_eq!(plan.warnings.len(), 3);
+        assert!(
+            plan.warnings
+                .iter()
+                .filter(|w| w.contains("'ended-key'"))
+                .count()
+                == 1,
+            "expected one warning for ended-key, got: {:?}",
+            plan.warnings
+        );
     }
 }

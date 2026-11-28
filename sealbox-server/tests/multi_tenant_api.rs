@@ -67,6 +67,51 @@ impl TestServer {
             .unwrap();
     }
 
+    /// Mark one specific version of `(namespace, key)` as already expired.
+    fn expire_version(&self, namespace: &str, key: &str, version: i32) {
+        let conn = rusqlite::Connection::open(self.dir.path().join("sealbox.db")).unwrap();
+        conn.execute(
+            "UPDATE secrets SET expires_at = 1 WHERE namespace = ?1 AND key = ?2 AND version = ?3",
+            (namespace, key, version),
+        )
+        .unwrap();
+    }
+
+    /// Count rows stored for `(namespace, key)` directly in SQLite.
+    fn row_count(&self, namespace: &str, key: &str) -> i64 {
+        let conn = rusqlite::Connection::open(self.dir.path().join("sealbox.db")).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM secrets WHERE namespace = ?1 AND key = ?2",
+            (namespace, key),
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    async fn save_secret_with_options(
+        &self,
+        token: &str,
+        key: &str,
+        master_key_id: &str,
+        encrypted_data: Vec<u8>,
+        ttl: Option<i64>,
+        metadata: Option<&str>,
+    ) -> (StatusCode, Value) {
+        self.json(
+            Method::PUT,
+            &format!("/v2/secrets/{key}"),
+            token,
+            Some(json!({
+                "encrypted_data": encrypted_data,
+                "encrypted_data_key": [9, 8, 7],
+                "master_key_id": master_key_id,
+                "ttl": ttl,
+                "metadata": metadata,
+            })),
+        )
+        .await
+    }
+
     async fn create_tenant(&self, name: &str) -> (String, String) {
         let (status, body) = self
             .json(
@@ -465,4 +510,253 @@ async fn cleanup_expired_is_tenant_scoped_for_tenants_and_global_for_root() {
         body["deleted_count"], 1,
         "tenant B's secret remained until root cleanup"
     );
+}
+
+#[tokio::test]
+async fn expired_newest_version_ends_whole_key_across_reads_listings_writes_and_deletes() {
+    let server = TestServer::new();
+    let (tenant_id, token) = server.create_tenant("Tenant Expiry").await;
+    let mk_id = server.register_key(&token, "public-expiry").await;
+
+    let cases: [(&str, Option<&str>); 3] = [
+        ("ended-secret", None),
+        (
+            "ended-cred",
+            Some(r#"{"type":"credential","username":"demo"}"#),
+        ),
+        ("ended-file", Some(r#"{"type":"file","filename":"a.txt"}"#)),
+    ];
+
+    for (key, meta) in cases {
+        let (s1, _) = server
+            .save_secret_with_options(&token, key, &mk_id, vec![1], None, meta)
+            .await;
+        assert_eq!(s1, StatusCode::OK);
+        let (s2, _) = server
+            .save_secret_with_options(&token, key, &mk_id, vec![2], Some(3600), meta)
+            .await;
+        assert_eq!(s2, StatusCode::OK);
+        server.expire_version(&tenant_id, key, 2);
+    }
+
+    // Active key with expired v1 and permanent v2.
+    server
+        .save_secret_with_options(&token, "active-key", &mk_id, vec![10], Some(3600), None)
+        .await;
+    server
+        .save_secret_with_options(&token, "active-key", &mk_id, vec![20], None, None)
+        .await;
+    server.expire_version(&tenant_id, "active-key", 1);
+
+    // Keys for testing write-before-cleanup and delete-by-version revival guards.
+    for key in ["write-revival", "delete-ver-revival"] {
+        server
+            .save_secret_with_options(&token, key, &mk_id, vec![1], None, None)
+            .await;
+        server
+            .save_secret_with_options(&token, key, &mk_id, vec![2], Some(3600), None)
+            .await;
+        server.expire_version(&tenant_id, key, 2);
+    }
+
+    // Listings omit every key whose newest version has expired while keeping active-key.
+    let (status, list_body) = server.json(Method::GET, "/v2/secrets", &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed_keys: Vec<&str> = list_body["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed_keys, vec!["active-key"]);
+
+    // History returns 404 for expired-newest keys and shows only v2 for active-key.
+    for (key, _) in cases {
+        let (status, _) = server
+            .json(
+                Method::GET,
+                &format!("/v2/secrets/{key}/history"),
+                &token,
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "history for {key}");
+    }
+    let (status, active_history) = server
+        .json(Method::GET, "/v2/secrets/active-key/history", &token, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(active_history["versions"].as_array().unwrap().len(), 1);
+    assert_eq!(active_history["versions"][0]["version"], 2);
+
+    // Reading an older version or latest version returns 404 and deletes all rows from SQLite.
+    let (status, _) = server
+        .json(
+            Method::GET,
+            "/v2/secrets/ended-secret?version=1",
+            &token,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(server.row_count(&tenant_id, "ended-secret"), 0);
+
+    let (status, _) = server
+        .json(Method::GET, "/v2/secrets/ended-cred", &token, None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(server.row_count(&tenant_id, "ended-cred"), 0);
+
+    let (status, _) = server
+        .json(
+            Method::GET,
+            "/v2/secrets/ended-file?version=1",
+            &token,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(server.row_count(&tenant_id, "ended-file"), 0);
+
+    // Active key still reads v2 cleanly and lazily removes its expired v1.
+    let (status, active_body) = server
+        .json(Method::GET, "/v2/secrets/active-key", &token, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(active_body["version"], 2);
+    assert_eq!(active_body["encrypted_data"], json!([20]));
+    assert_eq!(server.row_count(&tenant_id, "active-key"), 1);
+
+    // Writing to an expired key before cleanup clears all expired rows and restarts at version 1.
+    let (status, written) = server
+        .save_secret_with_options(&token, "write-revival", &mk_id, vec![3], None, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(written["version"], 1);
+    assert_eq!(server.row_count(&tenant_id, "write-revival"), 1);
+    let (status, history) = server
+        .json(
+            Method::GET,
+            "/v2/secrets/write-revival/history",
+            &token,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(history["versions"].as_array().unwrap().len(), 1);
+    assert_eq!(history["versions"][0]["version"], 1);
+
+    // Deleting the expired newest version before cleanup deletes the whole key and returns 404.
+    let (status, _) = server
+        .json(
+            Method::DELETE,
+            "/v2/secrets/delete-ver-revival?version=2",
+            &token,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(server.row_count(&tenant_id, "delete-ver-revival"), 0);
+}
+
+#[tokio::test]
+async fn cleanup_expired_and_startup_remove_all_versions_of_expired_keys_and_isolate_tenants() {
+    let server = TestServer::new();
+    let (tenant_a, token_a) = server.create_tenant("Tenant A").await;
+    let (tenant_b, token_b) = server.create_tenant("Tenant B").await;
+    let mk_a = server.register_key(&token_a, "public-a").await;
+    let mk_b = server.register_key(&token_b, "public-b").await;
+
+    // Tenant A: expired-newest (2 rows), active with expired v1 (2 rows), permanent (1 row).
+    server
+        .save_secret_with_options(&token_a, "ended-a", &mk_a, vec![1], None, None)
+        .await;
+    server
+        .save_secret_with_options(&token_a, "ended-a", &mk_a, vec![2], Some(3600), None)
+        .await;
+    server.expire_version(&tenant_a, "ended-a", 2);
+
+    server
+        .save_secret_with_options(&token_a, "active-a", &mk_a, vec![1], Some(3600), None)
+        .await;
+    server
+        .save_secret_with_options(&token_a, "active-a", &mk_a, vec![2], None, None)
+        .await;
+    server.expire_version(&tenant_a, "active-a", 1);
+
+    server
+        .save_secret_with_options(&token_a, "perm-a", &mk_a, vec![9], None, None)
+        .await;
+
+    // Tenant B: expired-newest (2 rows) and another expired-newest for startup test.
+    server
+        .save_secret_with_options(&token_b, "ended-b", &mk_b, vec![1], None, None)
+        .await;
+    server
+        .save_secret_with_options(&token_b, "ended-b", &mk_b, vec![2], Some(3600), None)
+        .await;
+    server.expire_version(&tenant_b, "ended-b", 2);
+
+    // Tenant A cleanup removes ended-a (2 rows) + expired v1 of active-a (1 row) = 3 rows.
+    let (status, body) = server
+        .json(Method::DELETE, "/v2/cleanup-expired", &token_a, None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deleted_count"], 3);
+    assert_eq!(server.row_count(&tenant_a, "ended-a"), 0);
+    assert_eq!(server.row_count(&tenant_a, "active-a"), 1);
+    assert_eq!(server.row_count(&tenant_a, "perm-a"), 1);
+    // Tenant B is untouched.
+    assert_eq!(server.row_count(&tenant_b, "ended-b"), 2);
+
+    // Admin cleanup removes Tenant B's 2 rows across all versions.
+    let (status, body) = server
+        .json(
+            Method::DELETE,
+            "/v2/admin/cleanup-expired",
+            &server.root_token,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deleted_count"], 2);
+    assert_eq!(server.row_count(&tenant_b, "ended-b"), 0);
+
+    // Create another expired-newest key for Tenant B and verify server startup cleanup removes all versions.
+    server
+        .save_secret_with_options(&token_b, "startup-ended-b", &mk_b, vec![1], None, None)
+        .await;
+    server
+        .save_secret_with_options(
+            &token_b,
+            "startup-ended-b",
+            &mk_b,
+            vec![2],
+            Some(3600),
+            None,
+        )
+        .await;
+    server.expire_version(&tenant_b, "startup-ended-b", 2);
+    assert_eq!(server.row_count(&tenant_b, "startup-ended-b"), 2);
+
+    let restarted = create_app(&SealboxConfig {
+        auth_token: server.root_token.clone(),
+        store_path: server.dir.path().join("sealbox.db").display().to_string(),
+        listen_addr: "127.0.0.1:0".to_string(),
+        legacy_v1_enabled: false,
+    })
+    .unwrap();
+    assert_eq!(server.row_count(&tenant_b, "startup-ended-b"), 0);
+    assert_eq!(server.row_count(&tenant_a, "active-a"), 1);
+    assert_eq!(server.row_count(&tenant_a, "perm-a"), 1);
+
+    // Active key remains readable on the restarted server.
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/v2/secrets/active-a")
+        .header("Authorization", format!("Bearer {token_a}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = restarted.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }

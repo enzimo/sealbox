@@ -262,6 +262,14 @@ pub(crate) trait SecretRepo: Send + Sync {
     ) -> Result<Vec<Secret>>;
     /// Update the master_key_id, encrypted_data_key, and updated_at fields for a list of secrets in a single transaction.
     fn update_secret_master_key(&self, conn: &rusqlite::Connection, secret: &Secret) -> Result<()>;
+    /// Return true when a specific `(namespace, key, version)` row is present in `secrets`.
+    fn secret_version_exists(
+        &self,
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        key: &str,
+        version: i32,
+    ) -> Result<bool>;
     /// Batch delete every version of keys whose newest version has expired,
     /// plus expired older versions under unexpired newest versions, across all
     /// tenants. Returns the total number of version rows removed.

@@ -749,6 +749,20 @@ impl SecretRepo for SqliteSecretRepo {
         Ok(())
     }
 
+    fn secret_version_exists(
+        &self,
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        key: &str,
+        version: i32,
+    ) -> Result<bool> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM secrets WHERE namespace = ?1 AND key = ?2 AND version = ?3)",
+        )?;
+        let exists: bool = stmt.query_row((namespace, key, version), |row| row.get(0))?;
+        Ok(exists)
+    }
+
     fn cleanup_expired_secrets(&self, conn: &rusqlite::Connection) -> Result<usize> {
         info!("cleanup_expired_secrets");
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
