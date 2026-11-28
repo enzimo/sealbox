@@ -121,6 +121,9 @@ pub(crate) async fn secrets(
                 .master_key_repo
                 .fetch_master_key(&conn, LEGACY_TENANT_ID, &params.master_key_id)?
                 .ok_or(SealboxError::MasterKeyNotFound(params.master_key_id))?;
+            state
+                .secret_repo
+                .cleanup_expired_secrets_in_namespace(&conn, LEGACY_TENANT_ID)?;
             let secrets = state.secret_repo.fetch_secrets_by_master_key(
                 &conn,
                 LEGACY_TENANT_ID,
@@ -160,6 +163,10 @@ pub(crate) async fn rotate(
                 .master_key_repo
                 .fetch_master_key(&conn, LEGACY_TENANT_ID, &new_master_key_id)?
                 .ok_or(SealboxError::MasterKeyNotFound(new_master_key_id))?;
+
+            state
+                .secret_repo
+                .cleanup_expired_secrets_in_namespace(&conn, LEGACY_TENANT_ID)?;
 
             let secrets = state.secret_repo.fetch_secrets_by_master_key(
                 &conn,
@@ -313,6 +320,9 @@ pub(crate) async fn secrets_v2(
         .master_key_repo
         .fetch_master_key(&conn, &principal.tenant_id, &params.master_key_id)?
         .ok_or(SealboxError::MasterKeyNotFound(params.master_key_id))?;
+    state
+        .secret_repo
+        .cleanup_expired_secrets_in_namespace(&conn, &principal.tenant_id)?;
     let secrets = state.secret_repo.fetch_secrets_by_master_key(
         &conn,
         &principal.tenant_id,
@@ -368,6 +378,9 @@ fn rotate_for_namespace(
         .master_key_repo
         .fetch_master_key(&conn, namespace, &new_master_key_id)?
         .ok_or(SealboxError::MasterKeyNotFound(new_master_key_id))?;
+    state
+        .secret_repo
+        .cleanup_expired_secrets_in_namespace(&conn, namespace)?;
     let secrets =
         state
             .secret_repo
@@ -701,5 +714,175 @@ mod tests {
             SealboxError::InvalidApiVersion => {} // Expected
             _ => panic!("Expected InvalidApiVersion error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_master_key_secrets_and_rotate_clean_up_expired_keys() {
+        let state = setup_test_state();
+        let (_, first_public_pem) = generate_key_pair().expect("Should generate first key pair");
+        let (_, second_public_pem) = generate_key_pair().expect("Should generate second key pair");
+        let principal = TenantPrincipal {
+            tenant_id: "tenant-1".to_string(),
+            token_id: Uuid::new_v4(),
+        };
+
+        let mk1: MasterKey = match create_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Json(CreateMasterKeyPayload {
+                public_key: first_public_pem,
+            }),
+        )
+        .await
+        .expect("Should create first master key")
+        {
+            SealboxResponse::Json(v) => serde_json::from_value(v).expect("Should parse master key"),
+            _ => panic!("Expected JSON"),
+        };
+
+        let mk2: MasterKey = match create_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Json(CreateMasterKeyPayload {
+                public_key: second_public_pem,
+            }),
+        )
+        .await
+        .expect("Should create second master key")
+        {
+            SealboxResponse::Json(v) => serde_json::from_value(v).expect("Should parse master key"),
+            _ => panic!("Expected JSON"),
+        };
+
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
+        {
+            let mut conn = state.conn_pool.lock().expect("Should lock db");
+            state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "active",
+                    "v1",
+                    mk1.clone(),
+                    None,
+                )
+                .expect("Should create active secret");
+            state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "expired-before-fetch",
+                    "permanent-v1",
+                    mk1.clone(),
+                    None,
+                )
+                .expect("Should create permanent v1");
+            let v2 = state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "expired-before-fetch",
+                    "temp-v2",
+                    mk1.clone(),
+                    Some(3600),
+                )
+                .expect("Should create temp v2");
+            conn.execute(
+                "UPDATE secrets SET expires_at = ?1 WHERE namespace = ?2 AND key = ?3 AND version = ?4",
+                (expired_at, &principal.tenant_id, "expired-before-fetch", v2.version),
+            )
+            .expect("Should expire v2");
+        }
+
+        // Fetching secrets for mk1 removes both versions of the expired key and returns only active.
+        let fetched_secrets: Vec<crate::repo::Secret> = match secrets_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Path(TenantMasterKeyIdPathParams {
+                master_key_id: mk1.id,
+            }),
+        )
+        .await
+        .expect("Should fetch secrets for master key")
+        {
+            SealboxResponse::Json(v) => {
+                serde_json::from_value(v.get("secrets").expect("Should have secrets").clone())
+                    .expect("Should parse secrets")
+            }
+            _ => panic!("Expected JSON"),
+        };
+        assert_eq!(fetched_secrets.len(), 1);
+        assert_eq!(fetched_secrets[0].key, "active");
+
+        // Add another expired key right before rotate and confirm rotate cleans it up instead of rewrapping it.
+        {
+            let mut conn = state.conn_pool.lock().expect("Should lock db");
+            let remaining_fetch_expired: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM secrets WHERE namespace = ?1 AND key = ?2",
+                    (&principal.tenant_id, "expired-before-fetch"),
+                    |row| row.get(0),
+                )
+                .expect("Should count rows");
+            assert_eq!(remaining_fetch_expired, 0);
+
+            state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "expired-before-rotate",
+                    "permanent-v1",
+                    mk1.clone(),
+                    None,
+                )
+                .expect("Should create permanent v1");
+            let v2 = state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "expired-before-rotate",
+                    "temp-v2",
+                    mk1.clone(),
+                    Some(3600),
+                )
+                .expect("Should create temp v2");
+            conn.execute(
+                "UPDATE secrets SET expires_at = ?1 WHERE namespace = ?2 AND key = ?3 AND version = ?4",
+                (expired_at, &principal.tenant_id, "expired-before-rotate", v2.version),
+            )
+            .expect("Should expire v2");
+        }
+
+        rotate_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Json(RotateMasterKeyPayload {
+                old_master_key_id: mk1.id,
+                new_master_key_id: mk2.id,
+                updates: vec![RewrappedSecretDataKey {
+                    namespace: principal.tenant_id.clone(),
+                    key: "active".to_string(),
+                    version: 1,
+                    encrypted_data_key: vec![9, 9, 9],
+                }],
+            }),
+        )
+        .await
+        .expect("Rotation should succeed after cleaning expired keys");
+
+        let conn = state.conn_pool.lock().expect("Should lock db");
+        let remaining_rotate_expired: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM secrets WHERE namespace = ?1 AND key = ?2",
+                (&principal.tenant_id, "expired-before-rotate"),
+                |row| row.get(0),
+            )
+            .expect("Should count rows");
+        assert_eq!(remaining_rotate_expired, 0);
     }
 }

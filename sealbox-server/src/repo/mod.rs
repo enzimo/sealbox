@@ -201,14 +201,20 @@ impl Secret {
 }
 
 pub(crate) trait SecretRepo: Send + Sync {
-    /// Get latest secret with atomic lazy cleanup
+    /// Get latest secret with atomic lazy cleanup.
+    ///
+    /// If the key's newest version has expired, all versions of the key are
+    /// deleted and `SecretNotFound` is returned.
     fn get_secret(
         &self,
         conn: &mut rusqlite::Connection,
         namespace: &str,
         key: &str,
     ) -> Result<Secret>;
-    /// Get specific version secret with atomic lazy cleanup
+    /// Get specific version secret with atomic lazy cleanup.
+    ///
+    /// If the key's newest version has expired, all versions of the key are
+    /// deleted and `SecretNotFound` is returned.
     fn get_secret_by_version(
         &self,
         conn: &mut rusqlite::Connection,
@@ -234,9 +240,14 @@ pub(crate) trait SecretRepo: Send + Sync {
         input: EncryptedSecretInput,
     ) -> Result<Secret>;
     fn delete_secret(&self, conn: &rusqlite::Connection, namespace: &str, key: &str) -> Result<()>;
+    /// Delete a specific version after applying the per-key expiry rule.
+    ///
+    /// If the key's newest version has already expired, all versions of the key
+    /// are deleted and `SecretNotFound` is returned so superseded versions are
+    /// never revived.
     fn delete_secret_by_version(
         &self,
-        conn: &rusqlite::Connection,
+        conn: &mut rusqlite::Connection,
         namespace: &str,
         key: &str,
         version: i32,
@@ -251,18 +262,24 @@ pub(crate) trait SecretRepo: Send + Sync {
     ) -> Result<Vec<Secret>>;
     /// Update the master_key_id, encrypted_data_key, and updated_at fields for a list of secrets in a single transaction.
     fn update_secret_master_key(&self, conn: &rusqlite::Connection, secret: &Secret) -> Result<()>;
-    /// Batch delete all expired secrets and return the count of deleted records.
+    /// Batch delete every version of keys whose newest version has expired,
+    /// plus expired older versions under unexpired newest versions, across all
+    /// tenants. Returns the total number of version rows removed.
     fn cleanup_expired_secrets(&self, conn: &rusqlite::Connection) -> Result<usize>;
-    /// Batch delete expired secrets in one tenant namespace.
+    /// Batch delete every version of keys whose newest version has expired,
+    /// plus expired older versions under unexpired newest versions, in one
+    /// tenant namespace. Returns the total number of version rows removed.
     fn cleanup_expired_secrets_in_namespace(
         &self,
         conn: &rusqlite::Connection,
         namespace: &str,
     ) -> Result<usize>;
-    /// List all secrets with basic information (key, latest version, timestamps)
+    /// List active secrets (keys whose newest version has not expired) with basic metadata.
     fn list_secrets(&self, conn: &rusqlite::Connection, namespace: &str)
     -> Result<Vec<SecretInfo>>;
-    /// List retained, non-expired versions for one secret key.
+    /// List retained, non-expired versions for one active secret key.
+    ///
+    /// Returns `SecretNotFound` when the key does not exist or its newest version has expired.
     fn list_secret_versions(
         &self,
         conn: &rusqlite::Connection,

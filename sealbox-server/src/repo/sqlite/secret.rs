@@ -12,6 +12,132 @@ const CREDENTIAL_VERSION_LIMIT: i32 = 10;
 /// than credentials to keep the database from growing without bound.
 const FILE_VERSION_LIMIT: i32 = 3;
 
+/// Shared CTE that annotates each row in the target scope with its key's
+/// version rank (`1` = newest version) and the newest version's `expires_at`.
+///
+/// Only metadata columns are selected so encrypted BLOBs are never copied into
+/// the CTE.
+macro_rules! classified_secrets_cte {
+    ($scope_where:literal) => {
+        concat!(
+            "WITH classified_secrets AS (
+                SELECT
+                    namespace,
+                    key,
+                    version,
+                    created_at,
+                    updated_at,
+                    expires_at,
+                    metadata,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY namespace, key
+                        ORDER BY version DESC
+                    ) AS version_rank,
+                    FIRST_VALUE(expires_at) OVER (
+                        PARTITION BY namespace, key
+                        ORDER BY version DESC
+                    ) AS latest_expires_at
+                FROM secrets
+                ",
+            $scope_where,
+            ")"
+        )
+    };
+}
+
+/// Shared two-valued expiry predicate for rows in `classified_secrets`.
+///
+/// A row is expired when either its own `expires_at` is strictly before `:now`
+/// or its key's newest version (`latest_expires_at`) is strictly before `:now`
+/// (in which case the whole key has expired and every version must be removed).
+///
+/// Both branches guard with `IS NOT NULL` before `< :now`, and `:now` is a
+/// non-null integer, so SQL three-valued logic always evaluates this predicate
+/// to 0 or 1 (never NULL) and `NOT (...)` is exact for active rows.
+macro_rules! classified_row_expired_sql {
+    () => {
+        "((expires_at IS NOT NULL AND expires_at < :now)
+          OR (latest_expires_at IS NOT NULL AND latest_expires_at < :now))"
+    };
+}
+
+const CLEANUP_EXPIRED_FOR_KEY_SQL: &str = concat!(
+    classified_secrets_cte!("WHERE namespace = :namespace AND key = :key"),
+    "
+    DELETE FROM secrets
+    WHERE namespace = :namespace
+      AND key = :key
+      AND version IN (
+          SELECT version
+          FROM classified_secrets
+          WHERE ",
+    classified_row_expired_sql!(),
+    "
+      )"
+);
+
+const CLEANUP_EXPIRED_NAMESPACE_SQL: &str = concat!(
+    classified_secrets_cte!("WHERE namespace = :namespace"),
+    "
+    DELETE FROM secrets
+    WHERE namespace = :namespace
+      AND (key, version) IN (
+          SELECT key, version
+          FROM classified_secrets
+          WHERE ",
+    classified_row_expired_sql!(),
+    "
+      )"
+);
+
+const CLEANUP_EXPIRED_ALL_SQL: &str = concat!(
+    classified_secrets_cte!(""),
+    "
+    DELETE FROM secrets
+    WHERE (namespace, key, version) IN (
+          SELECT namespace, key, version
+          FROM classified_secrets
+          WHERE ",
+    classified_row_expired_sql!(),
+    "
+      )"
+);
+
+const LIST_SECRETS_SQL: &str = concat!(
+    classified_secrets_cte!("WHERE namespace = :namespace"),
+    "
+    SELECT
+        key,
+        version,
+        created_at,
+        updated_at,
+        expires_at,
+        metadata
+    FROM classified_secrets
+    WHERE version_rank = 1
+      AND NOT ",
+    classified_row_expired_sql!(),
+    "
+    ORDER BY updated_at DESC"
+);
+
+const LIST_SECRET_VERSIONS_SQL: &str = concat!(
+    classified_secrets_cte!("WHERE namespace = :namespace AND key = :key"),
+    "
+    SELECT
+        key,
+        version,
+        created_at,
+        updated_at,
+        expires_at,
+        metadata
+    FROM classified_secrets
+    WHERE NOT ",
+    classified_row_expired_sql!(),
+    "
+    ORDER BY version DESC"
+);
+
 #[derive(Debug, Clone)]
 pub(crate) struct SqliteSecretRepo;
 
@@ -97,40 +223,118 @@ impl SqliteSecretRepo {
         tx: &rusqlite::Transaction,
         namespace: &str,
         key: &str,
-    ) -> Result<()> {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        tx.execute(
-            "DELETE FROM secrets
-             WHERE namespace = ?1
-               AND key = ?2
-               AND expires_at IS NOT NULL
-               AND expires_at < ?3",
-            (namespace, key, now),
+        now: i64,
+    ) -> Result<usize> {
+        let deleted_count = tx.execute(
+            CLEANUP_EXPIRED_FOR_KEY_SQL,
+            rusqlite::named_params! {
+                ":namespace": namespace,
+                ":key": key,
+                ":now": now,
+            },
         )?;
-        Ok(())
+        if deleted_count > 0 {
+            info!(
+                "Deleted {} expired secret row(s) for '{}' in namespace '{}'",
+                deleted_count, key, namespace
+            );
+        }
+        Ok(deleted_count)
     }
 
-    /// Helper function to check expiry and clean up expired secrets atomically
-    fn check_and_cleanup_expired(
-        tx: &rusqlite::Transaction,
-        secret: &Secret,
-    ) -> Result<Option<Secret>> {
-        if let Some(expires_at) = secret.expires_at {
-            let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            if expires_at < now {
-                // Secret has expired, delete it atomically within transaction
-                tx.execute(
-                    "DELETE FROM secrets WHERE namespace = ?1 AND key = ?2 AND version = ?3",
-                    rusqlite::params![&secret.namespace, &secret.key, &secret.version],
-                )?;
-                info!(
-                    "Secret '{}' version {} has expired and been deleted",
-                    secret.key, secret.version
-                );
-                return Ok(None);
-            }
+    fn cleanup_expired_secrets_at(&self, conn: &rusqlite::Connection, now: i64) -> Result<usize> {
+        let deleted_count = conn.execute(
+            CLEANUP_EXPIRED_ALL_SQL,
+            rusqlite::named_params! { ":now": now },
+        )?;
+        info!("Cleaned up {} expired secrets", deleted_count);
+        Ok(deleted_count)
+    }
+
+    fn cleanup_expired_secrets_in_namespace_at(
+        &self,
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        now: i64,
+    ) -> Result<usize> {
+        let deleted_count = conn.execute(
+            CLEANUP_EXPIRED_NAMESPACE_SQL,
+            rusqlite::named_params! {
+                ":namespace": namespace,
+                ":now": now,
+            },
+        )?;
+        info!(
+            "Cleaned up {} expired secrets in namespace {}",
+            deleted_count, namespace
+        );
+        Ok(deleted_count)
+    }
+
+    fn list_secrets_at(
+        &self,
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        now: i64,
+    ) -> Result<Vec<crate::repo::SecretInfo>> {
+        let mut stmt = conn.prepare_cached(LIST_SECRETS_SQL)?;
+        let secret_infos = stmt
+            .query_map(
+                rusqlite::named_params! {
+                    ":namespace": namespace,
+                    ":now": now,
+                },
+                |row| {
+                    Ok(crate::repo::SecretInfo {
+                        key: row.get(0)?,
+                        version: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        expires_at: row.get(4)?,
+                        metadata: row.get(5)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| SealboxError::DatabaseError(e.to_string()))?;
+
+        Ok(secret_infos)
+    }
+
+    fn list_secret_versions_at(
+        &self,
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        key: &str,
+        now: i64,
+    ) -> Result<Vec<crate::repo::SecretInfo>> {
+        let mut stmt = conn.prepare_cached(LIST_SECRET_VERSIONS_SQL)?;
+        let secret_infos = stmt
+            .query_map(
+                rusqlite::named_params! {
+                    ":namespace": namespace,
+                    ":key": key,
+                    ":now": now,
+                },
+                |row| {
+                    Ok(crate::repo::SecretInfo {
+                        key: row.get(0)?,
+                        version: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        expires_at: row.get(4)?,
+                        metadata: row.get(5)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| SealboxError::DatabaseError(e.to_string()))?;
+
+        if secret_infos.is_empty() {
+            return Err(SealboxError::SecretNotFound(key.to_string()));
         }
-        Ok(Some(secret.clone()))
+
+        Ok(secret_infos)
     }
 
     /// Common implementation for getting secrets with atomic cleanup
@@ -141,10 +345,11 @@ impl SqliteSecretRepo {
         params: impl rusqlite::Params,
         namespace: &str,
         key: &str,
+        now: i64,
     ) -> Result<Secret> {
         let tx = conn.transaction()?;
 
-        Self::cleanup_expired_for_key(&tx, namespace, key)?;
+        Self::cleanup_expired_for_key(&tx, namespace, key, now)?;
 
         let row = {
             let mut stmt = tx.prepare_cached(query)?;
@@ -155,21 +360,11 @@ impl SqliteSecretRepo {
                 .map_err(|e| SealboxError::DatabaseError(e.to_string()))?
         };
 
+        tx.commit()?;
+
         match row {
-            Some(secret) => match Self::check_and_cleanup_expired(&tx, &secret)? {
-                Some(valid_secret) => {
-                    tx.commit()?;
-                    Ok(valid_secret)
-                }
-                None => {
-                    tx.commit()?;
-                    Err(SealboxError::SecretNotFound(key.to_string()))
-                }
-            },
-            None => {
-                tx.commit()?;
-                Err(SealboxError::SecretNotFound(key.to_string()))
-            }
+            Some(secret) => Ok(secret),
+            None => Err(SealboxError::SecretNotFound(key.to_string())),
         }
     }
 }
@@ -235,7 +430,7 @@ impl SqliteSecretRepo {
 
     fn delete_secret_by_version(
         &self,
-        conn: &rusqlite::Connection,
+        conn: &mut rusqlite::Connection,
         key: &str,
         version: i32,
     ) -> Result<()> {
@@ -282,6 +477,7 @@ impl SecretRepo for SqliteSecretRepo {
         key: &str,
     ) -> Result<Secret> {
         info!("get_secret: namespace={}, key={}", namespace, key);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
         self.get_secret_with_query(
             conn,
@@ -303,6 +499,7 @@ impl SecretRepo for SqliteSecretRepo {
             (namespace, key),
             namespace,
             key,
+            now,
         )
     }
 
@@ -317,6 +514,7 @@ impl SecretRepo for SqliteSecretRepo {
             "get_secret_by_version: namespace={}, key={}, version={}",
             namespace, key, version
         );
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
         self.get_secret_with_query(
             conn,
@@ -337,6 +535,7 @@ impl SecretRepo for SqliteSecretRepo {
             (namespace, key, version),
             namespace,
             key,
+            now,
         )
     }
 
@@ -353,6 +552,8 @@ impl SecretRepo for SqliteSecretRepo {
         info!("create_new_version");
 
         let tx = conn.transaction()?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        Self::cleanup_expired_for_key(&tx, namespace, key, now)?;
 
         let next_version = {
             let mut stmt = tx.prepare(
@@ -406,6 +607,8 @@ impl SecretRepo for SqliteSecretRepo {
         info!("create_new_encrypted_version");
 
         let tx = conn.transaction()?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        Self::cleanup_expired_for_key(&tx, namespace, key, now)?;
 
         let next_version = {
             let mut stmt = tx.prepare(
@@ -464,16 +667,22 @@ impl SecretRepo for SqliteSecretRepo {
 
     fn delete_secret_by_version(
         &self,
-        conn: &rusqlite::Connection,
+        conn: &mut rusqlite::Connection,
         namespace: &str,
         key: &str,
         version: i32,
     ) -> Result<()> {
         info!("delete_secret_by_version");
-        let changed = conn.execute(
+        let tx = conn.transaction()?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        Self::cleanup_expired_for_key(&tx, namespace, key, now)?;
+
+        let changed = tx.execute(
             "DELETE FROM secrets WHERE namespace = ?1 AND key = ?2 AND version = ?3",
             (namespace, key, version),
         )?;
+        tx.commit()?;
+
         if changed == 0 {
             return Err(SealboxError::SecretNotFound(key.to_string()));
         }
@@ -543,12 +752,7 @@ impl SecretRepo for SqliteSecretRepo {
     fn cleanup_expired_secrets(&self, conn: &rusqlite::Connection) -> Result<usize> {
         info!("cleanup_expired_secrets");
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let deleted_count = conn.execute(
-            "DELETE FROM secrets WHERE expires_at IS NOT NULL AND expires_at < ?1",
-            [now],
-        )?;
-        info!("Cleaned up {} expired secrets", deleted_count);
-        Ok(deleted_count)
+        self.cleanup_expired_secrets_at(conn, now)
     }
 
     fn cleanup_expired_secrets_in_namespace(
@@ -561,16 +765,7 @@ impl SecretRepo for SqliteSecretRepo {
             namespace
         );
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let deleted_count = conn.execute(
-            "DELETE FROM secrets
-             WHERE namespace = ?1 AND expires_at IS NOT NULL AND expires_at < ?2",
-            (namespace, now),
-        )?;
-        info!(
-            "Cleaned up {} expired secrets in namespace {}",
-            deleted_count, namespace
-        );
-        Ok(deleted_count)
+        self.cleanup_expired_secrets_in_namespace_at(conn, namespace, now)
     }
 
     fn list_secrets(
@@ -580,50 +775,7 @@ impl SecretRepo for SqliteSecretRepo {
     ) -> Result<Vec<crate::repo::SecretInfo>> {
         info!("list_secrets: namespace={}", namespace);
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-
-        let mut stmt = conn.prepare(
-            "SELECT 
-                key,
-                version,
-                created_at,
-                updated_at,
-                expires_at,
-                metadata
-            FROM (
-                SELECT
-                    key,
-                    version,
-                    created_at,
-                    updated_at,
-                    expires_at,
-                    metadata,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY namespace, key
-                        ORDER BY version DESC
-                    ) AS row_num
-                FROM secrets
-                WHERE namespace = ?1
-                  AND (expires_at IS NULL OR expires_at > ?2)
-            )
-            WHERE row_num = 1
-            ORDER BY updated_at DESC",
-        )?;
-
-        let secret_infos = stmt
-            .query_map((namespace, now), |row| {
-                Ok(crate::repo::SecretInfo {
-                    key: row.get(0)?,
-                    version: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    expires_at: row.get(4)?,
-                    metadata: row.get(5)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| SealboxError::DatabaseError(e.to_string()))?;
-
-        Ok(secret_infos)
+        self.list_secrets_at(conn, namespace, now)
     }
 
     fn list_secret_versions(
@@ -634,41 +786,7 @@ impl SecretRepo for SqliteSecretRepo {
     ) -> Result<Vec<crate::repo::SecretInfo>> {
         info!("list_secret_versions: namespace={}, key={}", namespace, key);
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-
-        let mut stmt = conn.prepare(
-            "SELECT
-                key,
-                version,
-                created_at,
-                updated_at,
-                expires_at,
-                metadata
-            FROM secrets
-            WHERE namespace = ?1
-              AND key = ?2
-              AND (expires_at IS NULL OR expires_at > ?3)
-            ORDER BY version DESC",
-        )?;
-
-        let secret_infos = stmt
-            .query_map((namespace, key, now), |row| {
-                Ok(crate::repo::SecretInfo {
-                    key: row.get(0)?,
-                    version: row.get(1)?,
-                    created_at: row.get(2)?,
-                    updated_at: row.get(3)?,
-                    expires_at: row.get(4)?,
-                    metadata: row.get(5)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| SealboxError::DatabaseError(e.to_string()))?;
-
-        if secret_infos.is_empty() {
-            return Err(SealboxError::SecretNotFound(key.to_string()));
-        }
-
-        Ok(secret_infos)
+        self.list_secret_versions_at(conn, namespace, key, now)
     }
 }
 
@@ -902,7 +1020,7 @@ mod tests {
             .expect("Should create version 2");
 
         // Delete version 1
-        repo.delete_secret_by_version(&conn_mut, secret_key, 1)
+        repo.delete_secret_by_version(&mut conn_mut, secret_key, 1)
             .expect("Should delete version 1");
 
         // Version 1 should be gone
@@ -919,10 +1037,10 @@ mod tests {
 
     #[test]
     fn test_delete_secret_by_version_not_found() {
-        let conn = setup_test_db();
+        let mut conn = setup_test_db();
         let repo = SqliteSecretRepo;
 
-        let result = repo.delete_secret_by_version(&conn, "nonexistent-key", 1);
+        let result = repo.delete_secret_by_version(&mut conn, "nonexistent-key", 1);
         assert!(result.is_err());
 
         match result.unwrap_err() {
@@ -1346,46 +1464,561 @@ mod tests {
         }
     }
 
+    fn count_secret_rows(conn: &rusqlite::Connection, namespace: &str, key: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM secrets WHERE namespace = ?1 AND key = ?2",
+            (namespace, key),
+            |row| row.get(0),
+        )
+        .expect("Should count secret rows")
+    }
+
+    fn set_secret_expires_at(
+        conn: &rusqlite::Connection,
+        namespace: &str,
+        key: &str,
+        version: i32,
+        expires_at: Option<i64>,
+    ) {
+        conn.execute(
+            "UPDATE secrets SET expires_at = ?1 WHERE namespace = ?2 AND key = ?3 AND version = ?4",
+            (expires_at, namespace, key, version),
+        )
+        .expect("Should update expires_at");
+    }
+
     #[test]
-    fn test_latest_expired_version_falls_back_to_previous_valid_version() {
-        let conn = setup_test_db();
+    fn test_expired_newest_version_ends_key_for_secret_credential_and_file() {
+        let mut conn = setup_test_db();
         let repo = SqliteSecretRepo;
         let master_key = create_test_master_key();
-        let mut conn_mut = conn;
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
 
-        let secret_v1 = repo
+        let cases: [(&str, Option<&str>); 3] = [
+            ("plain-key", None),
+            (
+                "cred-key",
+                Some(r#"{"type":"credential","username":"app_user"}"#),
+            ),
+            ("file-key", Some(r#"{"type":"file","filename":"cert.pem"}"#)),
+        ];
+
+        for (key, metadata) in cases {
+            repo.create_new_encrypted_version(
+                &mut conn,
+                key,
+                EncryptedSecretInput {
+                    encrypted_data: vec![1],
+                    encrypted_data_key: vec![1],
+                    master_key_id: master_key.id,
+                    ttl: None,
+                    metadata: metadata.map(str::to_string),
+                },
+            )
+            .expect("Should create permanent v1");
+
+            let v2 = repo
+                .create_new_encrypted_version(
+                    &mut conn,
+                    key,
+                    EncryptedSecretInput {
+                        encrypted_data: vec![2],
+                        encrypted_data_key: vec![2],
+                        master_key_id: master_key.id,
+                        ttl: Some(3600),
+                        metadata: metadata.map(str::to_string),
+                    },
+                )
+                .expect("Should create TTL v2");
+
+            set_secret_expires_at(
+                &conn,
+                crate::repo::LEGACY_TENANT_ID,
+                key,
+                v2.version,
+                Some(expired_at),
+            );
+        }
+
+        // Before any read or cleanup runs, listings must omit every expired key and its history.
+        assert!(repo.list_secrets(&conn).expect("Should list").is_empty());
+        for (key, _) in cases {
+            assert!(matches!(
+                repo.list_secret_versions(&conn, key),
+                Err(SealboxError::SecretNotFound(ref k)) if k == key
+            ));
+            assert_eq!(
+                count_secret_rows(&conn, crate::repo::LEGACY_TENANT_ID, key),
+                2
+            );
+        }
+
+        // Reading by key deletes all versions of plain-key.
+        assert!(matches!(
+            repo.get_secret(&mut conn, "plain-key"),
+            Err(SealboxError::SecretNotFound(ref k)) if k == "plain-key"
+        ));
+        assert_eq!(
+            count_secret_rows(&conn, crate::repo::LEGACY_TENANT_ID, "plain-key"),
+            0
+        );
+
+        // Reading the older permanent version directly also ends cred-key and removes all rows.
+        assert!(matches!(
+            repo.get_secret_by_version(&mut conn, "cred-key", 1),
+            Err(SealboxError::SecretNotFound(ref k)) if k == "cred-key"
+        ));
+        assert_eq!(
+            count_secret_rows(&conn, crate::repo::LEGACY_TENANT_ID, "cred-key"),
+            0
+        );
+
+        // Reading the expired latest version of file-key removes both rows too.
+        assert!(matches!(
+            repo.get_secret_by_version(&mut conn, "file-key", 2),
+            Err(SealboxError::SecretNotFound(ref k)) if k == "file-key"
+        ));
+        assert_eq!(
+            count_secret_rows(&conn, crate::repo::LEGACY_TENANT_ID, "file-key"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_expired_older_version_under_unexpired_newest_is_removed_alone() {
+        let mut conn = setup_test_db();
+        let repo = SqliteSecretRepo;
+        let master_key = create_test_master_key();
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
+
+        let v1 = repo
             .create_new_version(
-                &mut conn_mut,
-                "rotating-secret",
-                "permanent-data",
+                &mut conn,
+                "active-key",
+                "old-temporary",
+                master_key.clone(),
+                Some(3600),
+            )
+            .expect("Should create v1");
+        let v2 = repo
+            .create_new_version(
+                &mut conn,
+                "active-key",
+                "current-permanent",
+                master_key,
+                None,
+            )
+            .expect("Should create v2");
+
+        set_secret_expires_at(
+            &conn,
+            crate::repo::LEGACY_TENANT_ID,
+            "active-key",
+            v1.version,
+            Some(expired_at),
+        );
+
+        // Listings show only v2.
+        let listed = repo.list_secrets(&conn).expect("Should list secrets");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key, "active-key");
+        assert_eq!(listed[0].version, v2.version);
+
+        let versions = repo
+            .list_secret_versions(&conn, "active-key")
+            .expect("Should list versions");
+        assert_eq!(
+            versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+            vec![v2.version]
+        );
+
+        // Reading v2 succeeds and cleans up expired v1.
+        let latest = repo
+            .get_secret(&mut conn, "active-key")
+            .expect("Should return unexpired newest version");
+        assert_eq!(latest.version, v2.version);
+        assert_eq!(
+            count_secret_rows(&conn, crate::repo::LEGACY_TENANT_ID, "active-key"),
+            1
+        );
+        assert!(matches!(
+            repo.get_secret_by_version(&mut conn, "active-key", v1.version),
+            Err(SealboxError::SecretNotFound(ref k)) if k == "active-key"
+        ));
+    }
+
+    #[test]
+    fn test_expiry_boundary_at_exact_now_is_consistent_across_reads_listings_and_cleanup() {
+        let mut conn = setup_test_db();
+        let repo = SqliteSecretRepo;
+        let master_key = create_test_master_key();
+        let fixed_now = 2_000_000_000i64;
+
+        repo.create_new_version(
+            &mut conn,
+            "boundary-key",
+            "v1-permanent",
+            master_key.clone(),
+            None,
+        )
+        .expect("Should create v1");
+        let v2 = repo
+            .create_new_version(
+                &mut conn,
+                "boundary-key",
+                "v2-boundary",
+                master_key,
+                Some(3600),
+            )
+            .expect("Should create v2");
+
+        set_secret_expires_at(
+            &conn,
+            crate::repo::LEGACY_TENANT_ID,
+            "boundary-key",
+            v2.version,
+            Some(fixed_now),
+        );
+
+        // At expires_at == now, the key is not yet past expires_at.
+        assert_eq!(
+            repo.list_secrets_at(&conn, crate::repo::LEGACY_TENANT_ID, fixed_now)
+                .expect("Should list at exact boundary")
+                .len(),
+            1
+        );
+        assert_eq!(
+            repo.list_secret_versions_at(
+                &conn,
+                crate::repo::LEGACY_TENANT_ID,
+                "boundary-key",
+                fixed_now
+            )
+            .expect("Should list versions at exact boundary")
+            .len(),
+            2
+        );
+        assert_eq!(
+            repo.cleanup_expired_secrets_in_namespace_at(
+                &conn,
+                crate::repo::LEGACY_TENANT_ID,
+                fixed_now
+            )
+            .expect("Should cleanup at exact boundary"),
+            0
+        );
+        let read_at_boundary = repo
+            .get_secret_with_query(
+                &mut conn,
+                "SELECT namespace, key, version, encrypted_data, encrypted_data_key, master_key_id, created_at, updated_at, expires_at, metadata FROM secrets WHERE namespace = ?1 AND key = ?2 ORDER BY version DESC LIMIT 1",
+                (crate::repo::LEGACY_TENANT_ID, "boundary-key"),
+                crate::repo::LEGACY_TENANT_ID,
+                "boundary-key",
+                fixed_now,
+            )
+            .expect("Key should remain readable when expires_at == now");
+        assert_eq!(read_at_boundary.version, v2.version);
+
+        // One second later (expires_at < now), listings and cleanup both treat the whole key as expired.
+        let past_now = fixed_now + 1;
+        assert!(
+            repo.list_secrets_at(&conn, crate::repo::LEGACY_TENANT_ID, past_now)
+                .expect("Should list past boundary")
+                .is_empty()
+        );
+        assert!(matches!(
+            repo.list_secret_versions_at(
+                &conn,
+                crate::repo::LEGACY_TENANT_ID,
+                "boundary-key",
+                past_now
+            ),
+            Err(SealboxError::SecretNotFound(ref k)) if k == "boundary-key"
+        ));
+        assert_eq!(
+            repo.cleanup_expired_secrets_in_namespace_at(
+                &conn,
+                crate::repo::LEGACY_TENANT_ID,
+                past_now
+            )
+            .expect("Should cleanup past boundary"),
+            2
+        );
+        assert_eq!(
+            count_secret_rows(&conn, crate::repo::LEGACY_TENANT_ID, "boundary-key"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_cleanup_expired_counts_all_versions_and_isolates_tenants() {
+        let mut conn = setup_test_db();
+        let repo = SqliteSecretRepo;
+        let master_key = create_test_master_key();
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
+
+        // Tenant A: expired-key has 3 versions (v1 permanent, v2 permanent, v3 expired).
+        for data in ["v1", "v2"] {
+            <SqliteSecretRepo as SecretRepo>::create_new_version(
+                &repo,
+                &mut conn,
+                "tenant-a",
+                "expired-key",
+                data,
                 master_key.clone(),
                 None,
             )
             .expect("Should create permanent version");
+        }
+        let a_v3 = <SqliteSecretRepo as SecretRepo>::create_new_version(
+            &repo,
+            &mut conn,
+            "tenant-a",
+            "expired-key",
+            "v3",
+            master_key.clone(),
+            Some(3600),
+        )
+        .expect("Should create v3");
+        set_secret_expires_at(
+            &conn,
+            "tenant-a",
+            "expired-key",
+            a_v3.version,
+            Some(expired_at),
+        );
 
-        let secret_v2 = repo
+        // Tenant A: active-key has v1 expired and v2 permanent.
+        let a_old = <SqliteSecretRepo as SecretRepo>::create_new_version(
+            &repo,
+            &mut conn,
+            "tenant-a",
+            "active-key",
+            "old",
+            master_key.clone(),
+            Some(3600),
+        )
+        .expect("Should create v1");
+        <SqliteSecretRepo as SecretRepo>::create_new_version(
+            &repo,
+            &mut conn,
+            "tenant-a",
+            "active-key",
+            "current",
+            master_key.clone(),
+            None,
+        )
+        .expect("Should create v2");
+        set_secret_expires_at(
+            &conn,
+            "tenant-a",
+            "active-key",
+            a_old.version,
+            Some(expired_at),
+        );
+
+        // Tenant B: same key name with permanent v1 and expired v2.
+        <SqliteSecretRepo as SecretRepo>::create_new_version(
+            &repo,
+            &mut conn,
+            "tenant-b",
+            "expired-key",
+            "b-v1",
+            master_key.clone(),
+            None,
+        )
+        .expect("Should create tenant-b v1");
+        let b_v2 = <SqliteSecretRepo as SecretRepo>::create_new_version(
+            &repo,
+            &mut conn,
+            "tenant-b",
+            "expired-key",
+            "b-v2",
+            master_key,
+            Some(3600),
+        )
+        .expect("Should create tenant-b v2");
+        set_secret_expires_at(
+            &conn,
+            "tenant-b",
+            "expired-key",
+            b_v2.version,
+            Some(expired_at),
+        );
+
+        // Tenant A cleanup removes 3 rows from expired-key + 1 expired old row from active-key = 4.
+        let tenant_a_deleted = repo
+            .cleanup_expired_secrets_in_namespace(&conn, "tenant-a")
+            .expect("Should clean tenant-a");
+        assert_eq!(tenant_a_deleted, 4);
+        assert_eq!(count_secret_rows(&conn, "tenant-a", "expired-key"), 0);
+        assert_eq!(count_secret_rows(&conn, "tenant-a", "active-key"), 1);
+        assert_eq!(
+            <SqliteSecretRepo as SecretRepo>::get_secret(
+                &repo,
+                &mut conn,
+                "tenant-a",
+                "active-key"
+            )
+            .expect("Tenant A active-key should remain readable")
+            .version,
+            2
+        );
+        // Tenant B is completely untouched.
+        assert_eq!(count_secret_rows(&conn, "tenant-b", "expired-key"), 2);
+
+        // All-tenant cleanup removes both versions of tenant B's expired key.
+        let all_deleted = repo
+            .cleanup_expired_secrets(&conn)
+            .expect("Should clean all tenants");
+        assert_eq!(all_deleted, 2);
+        assert_eq!(count_secret_rows(&conn, "tenant-b", "expired-key"), 0);
+        assert_eq!(count_secret_rows(&conn, "tenant-a", "active-key"), 1);
+    }
+
+    #[test]
+    fn test_write_before_cleanup_removes_expired_key_and_restarts_at_version_one() {
+        let mut conn = setup_test_db();
+        let repo = SqliteSecretRepo;
+        let master_key = create_test_master_key();
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
+
+        // Scenario A via create_new_encrypted_version (production write path).
+        repo.create_new_encrypted_version(
+            &mut conn,
+            "reused-encrypted",
+            EncryptedSecretInput {
+                encrypted_data: vec![1, 1],
+                encrypted_data_key: vec![1],
+                master_key_id: master_key.id,
+                ttl: None,
+                metadata: None,
+            },
+        )
+        .expect("Should create permanent v1");
+        let v2 = repo
+            .create_new_encrypted_version(
+                &mut conn,
+                "reused-encrypted",
+                EncryptedSecretInput {
+                    encrypted_data: vec![2, 2],
+                    encrypted_data_key: vec![2],
+                    master_key_id: master_key.id,
+                    ttl: Some(3600),
+                    metadata: None,
+                },
+            )
+            .expect("Should create TTL v2");
+        set_secret_expires_at(
+            &conn,
+            crate::repo::LEGACY_TENANT_ID,
+            "reused-encrypted",
+            v2.version,
+            Some(expired_at),
+        );
+
+        // Save a new value before any read or cleanup runs.
+        let replacement = repo
+            .create_new_encrypted_version(
+                &mut conn,
+                "reused-encrypted",
+                EncryptedSecretInput {
+                    encrypted_data: vec![3, 3],
+                    encrypted_data_key: vec![3],
+                    master_key_id: master_key.id,
+                    ttl: None,
+                    metadata: None,
+                },
+            )
+            .expect("Should create replacement secret");
+
+        assert_eq!(replacement.version, 1);
+        assert_eq!(
+            count_secret_rows(&conn, crate::repo::LEGACY_TENANT_ID, "reused-encrypted"),
+            1
+        );
+        let history = repo
+            .list_secret_versions(&conn, "reused-encrypted")
+            .expect("Should list history");
+        assert_eq!(
+            history.iter().map(|v| v.version).collect::<Vec<_>>(),
+            vec![1]
+        );
+        let fetched = repo
+            .get_secret_by_version(&mut conn, "reused-encrypted", 1)
+            .expect("Should read new v1");
+        assert_eq!(fetched.encrypted_data, vec![3, 3]);
+
+        // Scenario A via test-only create_new_version.
+        repo.create_new_version(
+            &mut conn,
+            "reused-helper",
+            "old-permanent",
+            master_key.clone(),
+            None,
+        )
+        .expect("Should create v1");
+        let helper_v2 = repo
             .create_new_version(
-                &mut conn_mut,
-                "rotating-secret",
-                "temporary-data",
-                master_key,
+                &mut conn,
+                "reused-helper",
+                "old-temp",
+                master_key.clone(),
                 Some(3600),
             )
-            .expect("Should create temporary version");
+            .expect("Should create v2");
+        set_secret_expires_at(
+            &conn,
+            crate::repo::LEGACY_TENANT_ID,
+            "reused-helper",
+            helper_v2.version,
+            Some(expired_at),
+        );
 
-        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 1;
-        conn_mut
-            .execute(
-                "UPDATE secrets SET expires_at = ?1 WHERE key = ?2 AND version = ?3",
-                (expired_at, "rotating-secret", secret_v2.version),
-            )
-            .expect("Should expire latest version");
+        let helper_replacement = repo
+            .create_new_version(&mut conn, "reused-helper", "fresh", master_key, None)
+            .expect("Should create replacement");
+        assert_eq!(helper_replacement.version, 1);
+        assert_eq!(
+            count_secret_rows(&conn, crate::repo::LEGACY_TENANT_ID, "reused-helper"),
+            1
+        );
+    }
 
-        let latest = repo
-            .get_secret(&mut conn_mut, "rotating-secret")
-            .expect("Should fall back to previous valid version");
+    #[test]
+    fn test_delete_secret_by_version_on_expired_key_removes_all_versions_and_returns_not_found() {
+        let mut conn = setup_test_db();
+        let repo = SqliteSecretRepo;
+        let master_key = create_test_master_key();
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
 
-        assert_eq!(latest.version, secret_v1.version);
+        for (key, target_version) in [("del-latest", 2), ("del-older", 1)] {
+            repo.create_new_version(&mut conn, key, "v1-permanent", master_key.clone(), None)
+                .expect("Should create v1");
+            let v2 = repo
+                .create_new_version(&mut conn, key, "v2-temp", master_key.clone(), Some(3600))
+                .expect("Should create v2");
+            set_secret_expires_at(
+                &conn,
+                crate::repo::LEGACY_TENANT_ID,
+                key,
+                v2.version,
+                Some(expired_at),
+            );
+
+            let err = repo
+                .delete_secret_by_version(&mut conn, key, target_version)
+                .expect_err("Deleting a version of an expired key must return SecretNotFound");
+            assert!(matches!(err, SealboxError::SecretNotFound(ref k) if k == key));
+            assert_eq!(
+                count_secret_rows(&conn, crate::repo::LEGACY_TENANT_ID, key),
+                0
+            );
+            assert!(matches!(
+                repo.get_secret(&mut conn, key),
+                Err(SealboxError::SecretNotFound(ref k)) if k == key
+            ));
+        }
     }
 
     #[test]
