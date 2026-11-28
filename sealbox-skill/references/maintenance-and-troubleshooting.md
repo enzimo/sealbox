@@ -20,7 +20,7 @@
   - For scripts, prefer `SEALBOX_TOKEN_FILE` and `--output json`. The CLI uses a 10 s connect timeout (nothing sent) and 60 s total timeout; a request or response-body timeout exits `1` with unknown server outcome and is safe to retry. Older CLIs without this subcommand exit `2` with `unrecognized subcommand`.
 - All-tenant manual cleanup (API-only, root token):
   - `DELETE /v2/admin/cleanup-expired` (removes every version of expired keys plus expired older versions across all tenants; `deleted_count` counts every removed version row).
-- Master key rotation cleans up expired entries before listing secrets to rewrap and before committing rotation. Each rewrapped update echoes `previous_encrypted_data_key_sha256` to bind it to the exact fetched row; if any row expired, was deleted, was added, or was re-saved between fetch and rotate, the server rejects the whole rotation cleanly so it can be retried.
+- Master key rotation cleans up expired entries before listing secrets to rewrap and before committing rotation. Every rewrapped update requires `previous_encrypted_data_key_sha256` to bind it to the exact fetched row (upgrade `sealbox-cli` together with the server before running `key rotate`); if any row expired, was deleted, was added, or was re-saved between fetch and rotate, the server rejects the whole rotation cleanly so it can be retried.
 - TTL checks are deterministic from creation timestamp + TTL seconds (`expires_at < now`).
 
 ## Migrations and compatibility

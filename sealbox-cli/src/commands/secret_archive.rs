@@ -338,11 +338,13 @@ struct CollectedExportRecords {
 
 /// Fetch and decrypt all versions for each listed key.
 ///
-/// If a key expires or is removed after listing (HTTP 404 on its history or on
-/// any version read), discard any buffered versions for that key, emit one
-/// warning, and continue exporting the remaining keys. Versions are fetched
-/// newest-first so an expired key stops immediately and never leaks a
-/// superseded older version into the archive, then stored oldest-first.
+/// Versions are fetched newest-first so an expired key stops on the first read
+/// and never leaks a superseded older version into the archive, then stored
+/// oldest-first. If a key expires or is removed after listing (HTTP 404 on its
+/// history or on its newest version read), skip the whole key with one warning
+/// and continue exporting the remaining keys. If only an older version returns
+/// 404 after the newest version succeeded, skip just that version with a
+/// per-version warning and keep the live versions already read.
 async fn collect_export_records(
     config: &Config,
     secret_infos: Vec<SecretInfo>,
@@ -376,8 +378,7 @@ async fn collect_export_records(
         };
 
         let mut key_records = Vec::with_capacity(versions.len());
-        let mut vanished = false;
-        for info in versions {
+        for (index, info) in versions.into_iter().enumerate() {
             match fetch_decrypted_secret_bytes(config, &info.key, Some(info.version)).await {
                 Ok(decrypted) => {
                     key_records.push(ExportSecretRecordV2 {
@@ -390,11 +391,16 @@ async fn collect_export_records(
                     });
                 }
                 Err(err) if is_secret_not_found(&err) => {
-                    vanished = true;
+                    if index == 0 {
+                        warnings.push(format!(
+                            "Skipping secret '{key_name}' during export: key expired or was removed after listing"
+                        ));
+                        break;
+                    }
                     warnings.push(format!(
-                        "Skipping secret '{key_name}' during export: key expired or was removed after listing"
+                        "Skipping version {} of secret '{key_name}' during export: version expired or was removed after listing",
+                        info.version
                     ));
-                    break;
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
@@ -407,7 +413,7 @@ async fn collect_export_records(
             }
         }
 
-        if vanished || key_records.is_empty() {
+        if key_records.is_empty() {
             continue;
         }
         key_records.reverse();
@@ -1476,5 +1482,240 @@ mod tests {
             .err()
             .expect("HTTP 500 must abort export rather than skip");
         assert!(err.to_string().contains("Failed to list versions"));
+    }
+
+    #[tokio::test]
+    async fn test_export_all_versions_keeps_live_key_when_older_version_returns_404() {
+        use axum::{
+            Json, Router,
+            extract::{Path as AxumPath, Query},
+            http::StatusCode,
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let keys = test_keys();
+        let pair_v2 = Arc::new(make_encrypted_secret(
+            "live-newest-expired-older",
+            2,
+            b"live-v2",
+            &keys.public_key,
+        ));
+        let triple_v3 = Arc::new(make_encrypted_secret(
+            "live-with-middle-expired",
+            3,
+            b"live-v3",
+            &keys.public_key,
+        ));
+        let triple_v1 = Arc::new(make_encrypted_secret(
+            "live-with-middle-expired",
+            1,
+            b"live-v1",
+            &keys.public_key,
+        ));
+
+        let router = Router::new()
+            .route(
+                "/v2/secrets",
+                get(|| async {
+                    Json(json!({
+                        "secrets": [
+                            {
+                                "key": "live-newest-expired-older",
+                                "version": 2,
+                                "created_at": 1_700_000_020,
+                                "updated_at": 1_700_000_020,
+                                "expires_at": null,
+                                "metadata": null
+                            },
+                            {
+                                "key": "live-with-middle-expired",
+                                "version": 3,
+                                "created_at": 1_700_000_030,
+                                "updated_at": 1_700_000_030,
+                                "expires_at": null,
+                                "metadata": null
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v2/secrets/{key}/history",
+                get(|AxumPath(key): AxumPath<String>| async move {
+                    match key.as_str() {
+                        "live-newest-expired-older" => (
+                            StatusCode::OK,
+                            Json(json!({
+                                "versions": [
+                                    {
+                                        "key": "live-newest-expired-older",
+                                        "version": 2,
+                                        "created_at": 1_700_000_020,
+                                        "updated_at": 1_700_000_020,
+                                        "expires_at": null,
+                                        "metadata": null
+                                    },
+                                    {
+                                        "key": "live-newest-expired-older",
+                                        "version": 1,
+                                        "created_at": 1_700_000_010,
+                                        "updated_at": 1_700_000_010,
+                                        "expires_at": 1_700_000_015,
+                                        "metadata": null
+                                    }
+                                ]
+                            })),
+                        )
+                            .into_response(),
+                        "live-with-middle-expired" => (
+                            StatusCode::OK,
+                            Json(json!({
+                                "versions": [
+                                    {
+                                        "key": "live-with-middle-expired",
+                                        "version": 3,
+                                        "created_at": 1_700_000_030,
+                                        "updated_at": 1_700_000_030,
+                                        "expires_at": null,
+                                        "metadata": null
+                                    },
+                                    {
+                                        "key": "live-with-middle-expired",
+                                        "version": 2,
+                                        "created_at": 1_700_000_020,
+                                        "updated_at": 1_700_000_020,
+                                        "expires_at": 1_700_000_025,
+                                        "metadata": null
+                                    },
+                                    {
+                                        "key": "live-with-middle-expired",
+                                        "version": 1,
+                                        "created_at": 1_700_000_010,
+                                        "updated_at": 1_700_000_010,
+                                        "expires_at": null,
+                                        "metadata": null
+                                    }
+                                ]
+                            })),
+                        )
+                            .into_response(),
+                        _ => (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({ "error": "Secret not found" })),
+                        )
+                            .into_response(),
+                    }
+                }),
+            )
+            .route(
+                "/v2/secrets/{key}",
+                get(
+                    move |AxumPath(key): AxumPath<String>,
+                          Query(query): Query<HashMap<String, String>>| {
+                        let pair_v2 = Arc::clone(&pair_v2);
+                        let triple_v3 = Arc::clone(&triple_v3);
+                        let triple_v1 = Arc::clone(&triple_v1);
+                        async move {
+                            match (key.as_str(), query.get("version").map(String::as_str)) {
+                                ("live-newest-expired-older", Some("2")) => {
+                                    (StatusCode::OK, Json(json!(*pair_v2))).into_response()
+                                }
+                                ("live-with-middle-expired", Some("3")) => {
+                                    (StatusCode::OK, Json(json!(*triple_v3))).into_response()
+                                }
+                                ("live-with-middle-expired", Some("1")) => {
+                                    (StatusCode::OK, Json(json!(*triple_v1))).into_response()
+                                }
+                                _ => (
+                                    StatusCode::NOT_FOUND,
+                                    Json(json!({ "error": "Secret not found" })),
+                                )
+                                    .into_response(),
+                            }
+                        }
+                    },
+                ),
+            );
+
+        let base_url = spawn_mock_export_server(router).await;
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.url = base_url;
+        config.server.token = "test-token".to_string();
+        config.keys.public_key_path = keys.public_key_path.clone();
+        config.keys.private_key_path = keys.private_key_path.clone();
+
+        let listed = fetch_secret_infos(&config).await.unwrap();
+        let collected = collect_export_records(&config, listed, true).await.unwrap();
+
+        assert_eq!(collected.key_count, 2);
+        let exported_versions: Vec<(&str, i32)> = collected
+            .records
+            .iter()
+            .map(|r| (r.key.as_str(), r.version))
+            .collect();
+        assert_eq!(
+            exported_versions,
+            vec![
+                ("live-newest-expired-older", 2),
+                ("live-with-middle-expired", 1),
+                ("live-with-middle-expired", 3),
+            ]
+        );
+        assert_eq!(collected.warnings.len(), 2);
+        assert!(
+            collected.warnings.iter().any(|w| {
+                w.contains("version 1")
+                    && w.contains("'live-newest-expired-older'")
+                    && w.contains("version expired or was removed after listing")
+            }),
+            "expected per-version warning for v1, got: {:?}",
+            collected.warnings
+        );
+        assert!(
+            collected.warnings.iter().any(|w| {
+                w.contains("version 2")
+                    && w.contains("'live-with-middle-expired'")
+                    && w.contains("version expired or was removed after listing")
+            }),
+            "expected per-version warning for v2, got: {:?}",
+            collected.warnings
+        );
+
+        // Even when the only matched key loses an older version mid-export,
+        // export_secrets succeeds and writes the live newest version.
+        let archive_path = temp_dir.path().join("only-live-newest.sealbox");
+        export_secrets(
+            &config,
+            &output(),
+            ExportOptions {
+                file: archive_path.display().to_string(),
+                keys_pattern: Some("live-newest-expired-older".to_string()),
+                format: "encrypted-tar".to_string(),
+                all_versions: true,
+                passphrase: false,
+                passphrase_file: None,
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let envelope_bytes = fs::read(&archive_path).unwrap();
+        let tar_bytes = decrypt_archive(
+            &envelope_bytes,
+            &keys.private_key_path,
+            &output(),
+            no_passphrase,
+        )
+        .unwrap();
+        let archived = read_archive_tar(&tar_bytes).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].key, "live-newest-expired-older");
+        assert_eq!(archived[0].version, 2);
+        assert_eq!(BASE64.decode(&archived[0].value_b64).unwrap(), b"live-v2");
     }
 }

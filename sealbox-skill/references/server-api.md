@@ -74,7 +74,7 @@ separate file resource: a file is a secret whose plaintext metadata carries
 - `GET /v1/master-key/by-id/:id/secrets`
   - Cleans up expired keys and expired older versions in the namespace, then returns encrypted records for client-side data-key rewrap.
 - `PUT /v1/master-key`
-  - Rotate active key using client-side rewrapped data keys. Cleans up expired keys first; each update echoes `previous_encrypted_data_key_sha256` to bind it to the exact fetched row, and the server rejects the whole rotation on any mismatch or missing row (including rows that expired, were deleted, or were re-saved at a reused version number between fetch and rotate) so stale updates never land.
+  - Rotate active key using client-side rewrapped data keys. Cleans up expired keys first; every update requires `previous_encrypted_data_key_sha256` to bind it to the exact fetched row (upgrade `sealbox-cli` together with the server before running `key rotate`), and the server rejects the whole rotation on any mismatch or missing row (including rows that expired, were deleted, or were re-saved at a reused version number between fetch and rotate) so stale updates never land.
 
 ### Admin
 

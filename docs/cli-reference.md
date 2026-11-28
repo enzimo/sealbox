@@ -164,7 +164,7 @@ sealbox-cli key rotate [OPTIONS]
 - `--url <url>` - Server URL (overrides config)
 - `--token <token>` - Authentication token (overrides config)
 
-**Expiry handling and row binding during rotation:** Before listing secrets to rewrap and before committing the rotation, the server cleans up expired keys and expired older versions in the tenant. Each rewrapped update echoes `previous_encrypted_data_key_sha256` (a SHA-256 digest of the fetched row's wrapped data key) to bind it to the exact row it was prepared from. If any row expires, is deleted, is added, or is re-saved at a reused version number between fetching secrets and submitting the rotation, the server rejects the whole rotation without mutating stored rows so you can safely re-run `key rotate`.
+**Expiry handling and row binding during rotation:** Before listing secrets to rewrap and before committing the rotation, the server cleans up expired keys and expired older versions in the tenant. Each rewrapped update requires `previous_encrypted_data_key_sha256` (a SHA-256 digest of the fetched row's wrapped data key) to bind it to the exact row it was prepared from—upgrade `sealbox-cli` together with the server before running `key rotate`. If any row expires, is deleted, is added, or is re-saved at a reused version number between fetching secrets and submitting the rotation, the server rejects the whole rotation without mutating stored rows so you can safely re-run `key rotate`.
 
 ### `key export`
 
@@ -411,7 +411,7 @@ sealbox-cli secret export <file> [OPTIONS]
 - `secrets.json`: one record per version, with base64 values so binary files round-trip
 - Output file permissions: `0600` on Unix
 - Version 1 archives from earlier releases can still be imported
-- If a listed key expires or is removed before its versions are read, `secret export` skips that key with a warning and continues exporting the remaining keys
+- If a listed key expires or is removed before its newest version is read, `secret export` skips that key with a warning and continues exporting the remaining keys; in `--all-versions` mode, if only an older version expires after the newest version was read, `secret export` skips that version alone with a warning and keeps the live key
 
 **Examples:**
 ```bash
