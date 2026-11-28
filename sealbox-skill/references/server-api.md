@@ -37,7 +37,7 @@ This document maps Sealbox HTTP behavior at a task level.
 - `GET /v1/secrets/:key/history`
   - List active version metadata for a key (`404` if the key's newest version has expired; omits expired older versions under an unexpired newest version).
 - `DELETE /v1/secrets/:key`
-  - Delete all versions unless `?version=<N>` is set. Deleting a specific version of a key whose newest version has already expired deletes all versions of the key and returns `404`.
+  - Delete all versions unless `?version=<N>` is set. Deleting a specific version of a key whose newest version has already expired deletes all versions of the key and returns `404`; deleting an existing expired older version under a live newest version removes it and returns `200`. Version numbers restart at `1` once a key is removed (expired or deleted) and are not stable identifiers across a key's removal.
 
 ### Credentials (username + password records)
 
@@ -74,7 +74,7 @@ separate file resource: a file is a secret whose plaintext metadata carries
 - `GET /v1/master-key/by-id/:id/secrets`
   - Cleans up expired keys and expired older versions in the namespace, then returns encrypted records for client-side data-key rewrap.
 - `PUT /v1/master-key`
-  - Rotate active key using client-side rewrapped data keys. Cleans up expired keys first; accepts and drops (with a warning log) updates for rows that expired and were removed between fetch and rotate, while rejecting unexpected updates for rows that still exist.
+  - Rotate active key using client-side rewrapped data keys. Cleans up expired keys first; each update echoes `previous_encrypted_data_key_sha256` to bind it to the exact fetched row, and the server rejects the whole rotation on any mismatch or missing row (including rows that expired, were deleted, or were re-saved at a reused version number between fetch and rotate) so stale updates never land.
 
 ### Admin
 
@@ -124,7 +124,7 @@ separate file resource: a file is a secret whose plaintext metadata carries
 
 ## API design notes
 
-- All data mutating endpoints are versioned per key where applicable.
+- All data mutating endpoints are versioned per key where applicable. Version numbers restart at `1` once a key is removed (expired or deleted), so version numbers are not stable identifiers across a key's removal.
 - `output_format` conventions are client-side (CLI or UI), not server-specific.
 - Expiry is decided by each key's newest version (highest version number): once the newest version passes `expires_at`, the whole key is gone (no fallback to older versions) across reads, listings, history, version delete, rotation, startup cleanup, and manual cleanup. An expired older version under an unexpired newest version is still removed on its own.
 - v1 and v2 are intentionally aligned for most behaviors to simplify migration and tooling.

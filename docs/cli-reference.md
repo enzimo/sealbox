@@ -164,7 +164,7 @@ sealbox-cli key rotate [OPTIONS]
 - `--url <url>` - Server URL (overrides config)
 - `--token <token>` - Authentication token (overrides config)
 
-**Expiry handling during rotation:** Before listing secrets to rewrap and before committing the rotation, the server cleans up expired keys and expired older versions in the tenant. If a row expires and is removed between fetching secrets and submitting the rewrapped data keys, rotation accepts and drops that update (logging a warning on the server) instead of failing; unexpected updates for rows that still exist are rejected.
+**Expiry handling and row binding during rotation:** Before listing secrets to rewrap and before committing the rotation, the server cleans up expired keys and expired older versions in the tenant. Each rewrapped update echoes `previous_encrypted_data_key_sha256` (a SHA-256 digest of the fetched row's wrapped data key) to bind it to the exact row it was prepared from. If any row expires, is deleted, is added, or is re-saved at a reused version number between fetching secrets and submitting the rotation, the server rejects the whole rotation without mutating stored rows so you can safely re-run `key rotate`.
 
 ### `key export`
 
@@ -230,7 +230,7 @@ sealbox-cli secret set <key> [value] [OPTIONS]
 
 **TTL Behavior:**
 - A key's expiry is decided by its newest version (highest version number). A value written with a TTL replaces the key until it expires; once that newest version passes `expires_at`, the whole key is treated as gone rather than silently reviving an older, superseded version (which is unsafe for credentials).
-- Saving a new value to an already-expired key clears its expired versions first in the same transaction and starts fresh at version `1`, so older versions are never revived.
+- Saving a new value to an already-expired key clears its expired versions first in the same transaction and starts fresh at version `1`, so older versions are never revived. Because version numbering restarts at `1` once a key is removed (expired or deleted), version numbers are **not** stable identifiers across a key's removal—re-check `secret history` (for example `created_at`) before addressing a specific `--version`.
 - An expired older version under a newer, unexpired version is still removed on its own while keeping the active key intact.
 - Expired keys (all versions) and expired older versions are deleted when accessed (lazy cleanup), on server startup, or via `sealbox-cli secret cleanup-expired` (per tenant) / `DELETE /v2/admin/cleanup-expired` (all tenants).
 
@@ -314,7 +314,9 @@ sealbox-cli secret history <key> [OPTIONS]
 
 ### `secret delete`
 
-Delete a secret and all stored versions by default, or delete one specific version. Deleting a specific version of a key whose newest version has already expired removes all versions of the key and returns not found (`404`).
+Delete a secret and all stored versions by default, or delete one specific version. Deleting a specific version of a key whose newest version has already expired removes all versions of the key and returns not found (`404`); deleting an existing expired older version under a live newest version removes it and succeeds.
+
+> **Version-number reuse:** Version numbers restart at `1` once a key is removed (expired or deleted), so version numbers are not stable identifiers across a key's removal. A stale `secret delete <key> --version N` issued after a key expired or was deleted and re-saved can delete the newly saved value; verify `secret history` first when deleting by version.
 
 ```bash
 sealbox-cli secret delete <key> [OPTIONS]
@@ -409,6 +411,7 @@ sealbox-cli secret export <file> [OPTIONS]
 - `secrets.json`: one record per version, with base64 values so binary files round-trip
 - Output file permissions: `0600` on Unix
 - Version 1 archives from earlier releases can still be imported
+- If a listed key expires or is removed before its versions are read, `secret export` skips that key with a warning and continues exporting the remaining keys
 
 **Examples:**
 ```bash

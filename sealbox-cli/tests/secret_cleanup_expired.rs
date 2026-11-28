@@ -18,7 +18,7 @@ use tokio::process::Command;
 
 const CLI_BIN: &str = env!("CARGO_BIN_EXE_sealbox-cli");
 const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
-const EXPIRY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const EXPIRY_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct CliOutput {
     code: Option<i32>,
@@ -1237,7 +1237,7 @@ async fn read_and_import_do_not_revive_expired_newest_version() {
             "ephemeral-override",
             "temp-v2",
             "--ttl",
-            "4",
+            "8",
         ],
     )
     .await
@@ -1335,6 +1335,79 @@ async fn read_and_import_do_not_revive_expired_newest_version() {
     imported_active.assert_success("get imported still-active");
     let active_json = parse_secret_get_json(&imported_active.stdout);
     assert_eq!(active_json["value"], "keep-me");
+}
+
+#[tokio::test]
+async fn cli_key_rotate_rewraps_with_row_digest_and_secret_decrypts_under_new_key() {
+    let server = LiveServer::start();
+    let (_tenant_id, token) = server.create_tenant("Tenant Rotate").await;
+    let home_old = tempfile::tempdir().expect("home old");
+    let home_new = tempfile::tempdir().expect("home new");
+    let envs = [
+        ("SEALBOX_URL", server.base_url.as_str()),
+        ("SEALBOX_TOKEN", token.as_str()),
+    ];
+
+    // Generate and register key 1 (Active), then store a secret.
+    setup_tenant_keys(&server, home_old.path(), &token).await;
+    run_cli(
+        home_old.path(),
+        &envs,
+        &["secret", "set", "rotated-secret", "roundtrip-value"],
+    )
+    .await
+    .assert_success("set rotated-secret");
+
+    // Generate and register key 2 (Retired).
+    setup_tenant_keys(&server, home_new.path(), &token).await;
+
+    // List keys to find old (Active) and new (Retired) master key IDs.
+    let list_out = run_cli(home_old.path(), &envs, &["key", "list", "--output", "json"]).await;
+    list_out.assert_success("key list");
+    let json_start = list_out.stdout.find('[').expect("JSON array in key list");
+    let keys: Vec<Value> =
+        serde_json::from_str(&list_out.stdout[json_start..]).expect("parse keys");
+    let old_key_id = keys
+        .iter()
+        .find(|k| k["status"] == "Active")
+        .expect("active key")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let new_key_id = keys
+        .iter()
+        .find(|k| k["status"] == "Retired")
+        .expect("retired key")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Rotate from old -> new using the old private key in home_old.
+    run_cli(
+        home_old.path(),
+        &envs,
+        &[
+            "key",
+            "rotate",
+            "--old-key-id",
+            &old_key_id,
+            "--new-key-id",
+            &new_key_id,
+        ],
+    )
+    .await
+    .assert_success("key rotate");
+
+    // Decrypt the rotated secret using the new private key in home_new.
+    let get_out = run_cli(
+        home_new.path(),
+        &envs,
+        &["secret", "get", "rotated-secret", "--output", "json"],
+    )
+    .await;
+    get_out.assert_success("get rotated-secret under new key");
+    let secret_json = parse_secret_get_json(&get_out.stdout);
+    assert_eq!(secret_json["value"], "roundtrip-value");
 }
 
 #[tokio::test]

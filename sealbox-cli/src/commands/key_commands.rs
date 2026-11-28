@@ -298,6 +298,7 @@ async fn rotate_keys(
                 "namespace": secret.namespace,
                 "key": secret.key,
                 "version": secret.version,
+                "previous_encrypted_data_key_sha256": sealbox_server::repo::encrypted_data_key_digest(&secret.encrypted_data_key),
                 "encrypted_data_key": encrypted_data_key
             }))
         })

@@ -25,7 +25,7 @@ use super::{
     private_file::write_private_file,
     secret_commands::{
         encrypt_and_store, fetch_active_master_key, fetch_decrypted_secret_bytes,
-        fetch_secret_history,
+        fetch_secret_history, is_secret_not_found,
     },
 };
 
@@ -186,40 +186,17 @@ pub async fn export_secrets(
         anyhow::bail!("No secrets matched export criteria");
     }
     secret_infos.sort_by(|left, right| left.key.cmp(&right.key));
-    let key_count = secret_infos.len();
 
     output.print_info("Decrypting secrets locally for encrypted archive export...");
-    let mut records = Vec::new();
-    for secret in secret_infos {
-        let versions = if options.all_versions {
-            let mut history = fetch_secret_history(config, &secret.key)
-                .await
-                .with_context(|| format!("Failed to list versions of '{}'", secret.key))?;
-            history.sort_by_key(|info| info.version);
-            history
-        } else {
-            vec![secret]
-        };
-
-        for info in versions {
-            let decrypted = fetch_decrypted_secret_bytes(config, &info.key, Some(info.version))
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to decrypt '{}' version {} for export",
-                        info.key, info.version
-                    )
-                })?;
-            records.push(ExportSecretRecordV2 {
-                key: decrypted.key,
-                version: decrypted.version,
-                value_b64: BASE64.encode(&decrypted.bytes),
-                created_at: Some(info.created_at),
-                expires_at: decrypted.expires_at,
-                metadata: decrypted.metadata,
-            });
-        }
+    let collected = collect_export_records(config, secret_infos, options.all_versions).await?;
+    for warning in &collected.warnings {
+        output.print_warning(warning);
     }
+    if collected.records.is_empty() {
+        anyhow::bail!("No active secrets remained to export");
+    }
+    let records = collected.records;
+    let key_count = collected.key_count;
 
     let manifest = ExportManifestV2 {
         format_version: ARCHIVE_FORMAT_VERSION,
@@ -351,6 +328,98 @@ pub async fn import_secrets(
     }))?;
 
     Ok(())
+}
+
+struct CollectedExportRecords {
+    records: Vec<ExportSecretRecordV2>,
+    key_count: usize,
+    warnings: Vec<String>,
+}
+
+/// Fetch and decrypt all versions for each listed key.
+///
+/// If a key expires or is removed after listing (HTTP 404 on its history or on
+/// any version read), discard any buffered versions for that key, emit one
+/// warning, and continue exporting the remaining keys. Versions are fetched
+/// newest-first so an expired key stops immediately and never leaks a
+/// superseded older version into the archive, then stored oldest-first.
+async fn collect_export_records(
+    config: &Config,
+    secret_infos: Vec<SecretInfo>,
+    all_versions: bool,
+) -> Result<CollectedExportRecords> {
+    let mut records = Vec::new();
+    let mut key_count = 0usize;
+    let mut warnings = Vec::new();
+
+    for secret in secret_infos {
+        let key_name = secret.key.clone();
+        let versions = if all_versions {
+            let mut history = match fetch_secret_history(config, &key_name).await {
+                Ok(history) => history,
+                Err(err) if is_secret_not_found(&err) => {
+                    warnings.push(format!(
+                        "Skipping secret '{key_name}' during export: key expired or was removed after listing"
+                    ));
+                    continue;
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("Failed to list versions of '{key_name}'"));
+                }
+            };
+            // Fetch newest first so an expired key fails on the first version read.
+            history.sort_by_key(|info| std::cmp::Reverse(info.version));
+            history
+        } else {
+            vec![secret]
+        };
+
+        let mut key_records = Vec::with_capacity(versions.len());
+        let mut vanished = false;
+        for info in versions {
+            match fetch_decrypted_secret_bytes(config, &info.key, Some(info.version)).await {
+                Ok(decrypted) => {
+                    key_records.push(ExportSecretRecordV2 {
+                        key: decrypted.key,
+                        version: decrypted.version,
+                        value_b64: BASE64.encode(&decrypted.bytes),
+                        created_at: Some(info.created_at),
+                        expires_at: decrypted.expires_at,
+                        metadata: decrypted.metadata,
+                    });
+                }
+                Err(err) if is_secret_not_found(&err) => {
+                    vanished = true;
+                    warnings.push(format!(
+                        "Skipping secret '{key_name}' during export: key expired or was removed after listing"
+                    ));
+                    break;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Failed to decrypt '{}' version {} for export",
+                            info.key, info.version
+                        )
+                    });
+                }
+            }
+        }
+
+        if vanished || key_records.is_empty() {
+            continue;
+        }
+        key_records.reverse();
+        records.extend(key_records);
+        key_count += 1;
+    }
+
+    Ok(CollectedExportRecords {
+        records,
+        key_count,
+        warnings,
+    })
 }
 
 struct PreparedImportPlan {
@@ -1112,5 +1181,300 @@ mod tests {
             "expected one warning for ended-key, got: {:?}",
             plan.warnings
         );
+    }
+
+    fn make_encrypted_secret(
+        key: &str,
+        version: i32,
+        plaintext: &[u8],
+        public_key: &PublicMasterKey,
+    ) -> sealbox_server::repo::Secret {
+        let data_key = DataKey::new();
+        let encrypted_data = data_key.encrypt(plaintext).unwrap();
+        let encrypted_data_key = public_key.encrypt(data_key.as_bytes()).unwrap();
+        sealbox_server::repo::Secret {
+            namespace: "tenant-test".to_string(),
+            key: key.to_string(),
+            version,
+            encrypted_data,
+            encrypted_data_key,
+            master_key_id: uuid::Uuid::new_v4(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            expires_at: None,
+            metadata: None,
+        }
+    }
+
+    async fn spawn_mock_export_server(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn test_export_skips_key_expired_after_listing_with_one_warning() {
+        use axum::{
+            Json, Router,
+            extract::{Path as AxumPath, Query},
+            http::StatusCode,
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let keys = test_keys();
+        let active_v1 = Arc::new(make_encrypted_secret(
+            "active-key",
+            1,
+            b"still-here",
+            &keys.public_key,
+        ));
+        let mid_v1 = Arc::new(make_encrypted_secret(
+            "expired-mid-versions",
+            1,
+            b"superseded-v1",
+            &keys.public_key,
+        ));
+
+        let active_for_get = Arc::clone(&active_v1);
+        let mid_for_get = Arc::clone(&mid_v1);
+
+        let router = Router::new()
+            .route(
+                "/v2/secrets",
+                get(|| async {
+                    Json(json!({
+                        "secrets": [
+                            {
+                                "key": "active-key",
+                                "version": 1,
+                                "created_at": 1_700_000_000,
+                                "updated_at": 1_700_000_000,
+                                "expires_at": null,
+                                "metadata": null
+                            },
+                            {
+                                "key": "expired-before-history",
+                                "version": 2,
+                                "created_at": 1_700_000_000,
+                                "updated_at": 1_700_000_000,
+                                "expires_at": 1_700_000_010,
+                                "metadata": null
+                            },
+                            {
+                                "key": "expired-mid-versions",
+                                "version": 2,
+                                "created_at": 1_700_000_000,
+                                "updated_at": 1_700_000_000,
+                                "expires_at": 1_700_000_010,
+                                "metadata": null
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/v2/secrets/{key}/history",
+                get(|AxumPath(key): AxumPath<String>| async move {
+                    match key.as_str() {
+                        "active-key" => (
+                            StatusCode::OK,
+                            Json(json!({
+                                "versions": [{
+                                    "key": "active-key",
+                                    "version": 1,
+                                    "created_at": 1_700_000_000,
+                                    "updated_at": 1_700_000_000,
+                                    "expires_at": null,
+                                    "metadata": null
+                                }]
+                            })),
+                        )
+                            .into_response(),
+                        "expired-before-history" => (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({ "error": "Secret not found: expired-before-history" })),
+                        )
+                            .into_response(),
+                        "expired-mid-versions" => (
+                            StatusCode::OK,
+                            Json(json!({
+                                "versions": [
+                                    {
+                                        "key": "expired-mid-versions",
+                                        "version": 2,
+                                        "created_at": 1_700_000_000,
+                                        "updated_at": 1_700_000_000,
+                                        "expires_at": 1_700_000_010,
+                                        "metadata": null
+                                    },
+                                    {
+                                        "key": "expired-mid-versions",
+                                        "version": 1,
+                                        "created_at": 1_700_000_000,
+                                        "updated_at": 1_700_000_000,
+                                        "expires_at": null,
+                                        "metadata": null
+                                    }
+                                ]
+                            })),
+                        )
+                            .into_response(),
+                        _ => (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({ "error": "Secret not found" })),
+                        )
+                            .into_response(),
+                    }
+                }),
+            )
+            .route(
+                "/v2/secrets/{key}",
+                get(
+                    move |AxumPath(key): AxumPath<String>,
+                          Query(query): Query<HashMap<String, String>>| {
+                        let active_for_get = Arc::clone(&active_for_get);
+                        let mid_for_get = Arc::clone(&mid_for_get);
+                        async move {
+                            match (key.as_str(), query.get("version").map(String::as_str)) {
+                                ("active-key", Some("1")) => {
+                                    (StatusCode::OK, Json(json!(*active_for_get))).into_response()
+                                }
+                                ("expired-mid-versions", Some("1")) => {
+                                    (StatusCode::OK, Json(json!(*mid_for_get))).into_response()
+                                }
+                                _ => (
+                                    StatusCode::NOT_FOUND,
+                                    Json(json!({ "error": "Secret not found" })),
+                                )
+                                    .into_response(),
+                            }
+                        }
+                    },
+                ),
+            );
+
+        let base_url = spawn_mock_export_server(router).await;
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.url = base_url;
+        config.server.token = "test-token".to_string();
+        config.keys.public_key_path = keys.public_key_path.clone();
+        config.keys.private_key_path = keys.private_key_path.clone();
+
+        // 1. All-versions mode: both expired keys are skipped with one warning each,
+        //    no superseded v1 leaks, and active-key is exported cleanly.
+        let listed = fetch_secret_infos(&config).await.unwrap();
+        let collected = collect_export_records(&config, listed, true).await.unwrap();
+        assert_eq!(collected.key_count, 1);
+        assert_eq!(collected.records.len(), 1);
+        assert_eq!(collected.records[0].key, "active-key");
+        assert_eq!(collected.warnings.len(), 2);
+        assert_eq!(
+            collected
+                .warnings
+                .iter()
+                .filter(|w| w.contains("'expired-before-history'"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            collected
+                .warnings
+                .iter()
+                .filter(|w| w.contains("'expired-mid-versions'"))
+                .count(),
+            1
+        );
+
+        // Full export_secrets writes an archive whose manifest records only the 1 exported key.
+        let archive_path = temp_dir.path().join("all-versions.sealbox");
+        export_secrets(
+            &config,
+            &output(),
+            ExportOptions {
+                file: archive_path.display().to_string(),
+                keys_pattern: None,
+                format: "encrypted-tar".to_string(),
+                all_versions: true,
+                passphrase: false,
+                passphrase_file: None,
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+        let envelope_bytes = fs::read(&archive_path).unwrap();
+        let tar_bytes = decrypt_archive(
+            &envelope_bytes,
+            &keys.private_key_path,
+            &output(),
+            no_passphrase,
+        )
+        .unwrap();
+        let archived = read_archive_tar(&tar_bytes).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].key, "active-key");
+
+        // 2. Single-version mode: keys returning 404 on version read are also skipped with one warning.
+        let listed_single = fetch_secret_infos(&config).await.unwrap();
+        let collected_single = collect_export_records(&config, listed_single, false)
+            .await
+            .unwrap();
+        assert_eq!(collected_single.key_count, 1);
+        assert_eq!(collected_single.records.len(), 1);
+        assert_eq!(collected_single.records[0].key, "active-key");
+        assert_eq!(collected_single.warnings.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_export_aborts_on_non_not_found_server_error() {
+        use axum::{Json, Router, http::StatusCode, routing::get};
+
+        let keys = test_keys();
+        let router = Router::new()
+            .route(
+                "/v2/secrets",
+                get(|| async {
+                    Json(json!({
+                        "secrets": [{
+                            "key": "failing-key",
+                            "version": 1,
+                            "created_at": 1_700_000_000,
+                            "updated_at": 1_700_000_000,
+                            "expires_at": null,
+                            "metadata": null
+                        }]
+                    }))
+                }),
+            )
+            .route(
+                "/v2/secrets/failing-key/history",
+                get(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": "db unavailable" })),
+                    )
+                }),
+            );
+
+        let base_url = spawn_mock_export_server(router).await;
+        let mut config = Config::default();
+        config.server.url = base_url;
+        config.server.token = "test-token".to_string();
+        config.keys.public_key_path = keys.public_key_path.clone();
+        config.keys.private_key_path = keys.private_key_path.clone();
+
+        let listed = fetch_secret_infos(&config).await.unwrap();
+        let err = collect_export_records(&config, listed, true)
+            .await
+            .err()
+            .expect("HTTP 500 must abort export rather than skip");
+        assert!(err.to_string().contains("Failed to list versions"));
     }
 }

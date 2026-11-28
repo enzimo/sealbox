@@ -99,9 +99,12 @@ pub struct SecretInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Secret {
-    pub namespace: String,           // Secret namespace, used for logical grouping
-    pub key: String,                 // Secret key identifier
-    pub version: i32,                // Version number, incremented on each insert
+    pub namespace: String, // Secret namespace, used for logical grouping
+    pub key: String,       // Secret key identifier
+    /// Version number, incremented on each insert. Restarts at `1` once a key is
+    /// removed (expired or deleted), so version numbers are not stable
+    /// identifiers across a key's removal.
+    pub version: i32,
     pub encrypted_data: Vec<u8>,     // The encrypted secret value
     pub encrypted_data_key: Vec<u8>, // The data key encrypted with user's public key
     pub master_key_id: Uuid,         // References master_keys.id (public key used)
@@ -109,6 +112,20 @@ pub struct Secret {
     pub updated_at: i64,             // Last update timestamp (Unix time)
     pub expires_at: Option<i64>,     // Expiry timestamp (Unix time), optional for TTL
     pub metadata: Option<String>,    // Optional metadata in serialized format
+}
+
+/// Stable identifier for a secret row's wrapped data key: `sha256:` followed by
+/// the lowercase hex SHA-256 digest of `encrypted_data_key`.
+///
+/// Master key rotation clients echo this digest so the server can bind each
+/// rewrapped data key to the exact row it was prepared from and reject stale
+/// updates when a key is re-saved at a reused version number.
+pub fn encrypted_data_key_digest(encrypted_data_key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(encrypted_data_key);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("sha256:{hex}")
 }
 
 pub(crate) struct EncryptedSecretInput {
@@ -214,7 +231,9 @@ pub(crate) trait SecretRepo: Send + Sync {
     /// Get specific version secret with atomic lazy cleanup.
     ///
     /// If the key's newest version has expired, all versions of the key are
-    /// deleted and `SecretNotFound` is returned.
+    /// deleted and `SecretNotFound` is returned. Note that version numbers
+    /// restart at `1` once a key is removed (expired or deleted), so a stored
+    /// version number is not a stable identifier across a key's removal.
     fn get_secret_by_version(
         &self,
         conn: &mut rusqlite::Connection,
@@ -244,7 +263,13 @@ pub(crate) trait SecretRepo: Send + Sync {
     ///
     /// If the key's newest version has already expired, all versions of the key
     /// are deleted and `SecretNotFound` is returned so superseded versions are
-    /// never revived.
+    /// never revived. If the key is still live and the targeted older version
+    /// existed (even if it had already expired and was removed by cleanup in
+    /// the same transaction), returns `Ok(())`.
+    ///
+    /// Note that version numbers restart at `1` once a key is removed (expired
+    /// or deleted), so version numbers are not stable identifiers across a
+    /// key's removal.
     fn delete_secret_by_version(
         &self,
         conn: &mut rusqlite::Connection,
@@ -260,16 +285,16 @@ pub(crate) trait SecretRepo: Send + Sync {
         namespace: &str,
         master_key_id: &Uuid,
     ) -> Result<Vec<Secret>>;
-    /// Update the master_key_id, encrypted_data_key, and updated_at fields for a list of secrets in a single transaction.
-    fn update_secret_master_key(&self, conn: &rusqlite::Connection, secret: &Secret) -> Result<()>;
-    /// Return true when a specific `(namespace, key, version)` row is present in `secrets`.
-    fn secret_version_exists(
+    /// Update `master_key_id`, `encrypted_data_key`, and `updated_at` for one
+    /// secret row only when it still holds `expected_master_key_id` and
+    /// `expected_encrypted_data_key`.
+    fn update_secret_master_key(
         &self,
         conn: &rusqlite::Connection,
-        namespace: &str,
-        key: &str,
-        version: i32,
-    ) -> Result<bool>;
+        secret: &Secret,
+        expected_master_key_id: &Uuid,
+        expected_encrypted_data_key: &[u8],
+    ) -> Result<()>;
     /// Batch delete every version of keys whose newest version has expired,
     /// plus expired older versions under unexpired newest versions, across all
     /// tenants. Returns the total number of version rows removed.

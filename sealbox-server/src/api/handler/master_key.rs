@@ -5,13 +5,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use tracing::{error, warn};
+use tracing::error;
 use uuid::Uuid;
 
 use crate::{
     api::{SealboxResponse, Version, auth::TenantPrincipal, path::Path, state::AppState},
     error::{Result, SealboxError},
-    repo::{LEGACY_TENANT_ID, MasterKey, MasterKeyStatus},
+    repo::{LEGACY_TENANT_ID, MasterKey, MasterKeyStatus, encrypted_data_key_digest},
 };
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -54,6 +54,10 @@ pub(crate) struct RewrappedSecretDataKey {
     namespace: String,
     key: String,
     version: i32,
+    /// `sha256:<hex>` digest of the `encrypted_data_key` fetched before rewrapping.
+    /// Binds this update to the exact stored row so a stale update can never land
+    /// on a re-saved row that reused the same version number.
+    previous_encrypted_data_key_sha256: String,
     encrypted_data_key: Vec<u8>,
 }
 
@@ -291,7 +295,13 @@ fn rotate_for_namespace(
         }
         let key = (update.namespace, update.key, update.version);
         if updates_by_secret
-            .insert(key, update.encrypted_data_key)
+            .insert(
+                key,
+                (
+                    update.previous_encrypted_data_key_sha256,
+                    update.encrypted_data_key,
+                ),
+            )
             .is_some()
         {
             return Err(SealboxError::InvalidRequest(
@@ -300,28 +310,43 @@ fn rotate_for_namespace(
         }
     }
 
+    let tx = conn.transaction()?;
     state
         .secret_repo
-        .cleanup_expired_secrets_in_namespace(&conn, namespace)?;
+        .cleanup_expired_secrets_in_namespace(&tx, namespace)?;
     let secrets =
         state
             .secret_repo
-            .fetch_secrets_by_master_key(&conn, namespace, &old_master_key_id)?;
+            .fetch_secrets_by_master_key(&tx, namespace, &old_master_key_id)?;
 
-    let tx = conn.transaction()?;
     for secret in secrets {
         let update_key = (secret.namespace.clone(), secret.key.clone(), secret.version);
-        let Some(encrypted_data_key) = updates_by_secret.remove(&update_key) else {
+        let Some((expected_previous_digest, encrypted_data_key)) =
+            updates_by_secret.remove(&update_key)
+        else {
             return Err(SealboxError::InvalidRequest(format!(
                 "missing rewrapped data key for {} version {}",
                 secret.key, secret.version
             )));
         };
+        let actual_digest = encrypted_data_key_digest(&secret.encrypted_data_key);
+        if expected_previous_digest != actual_digest {
+            return Err(SealboxError::InvalidRequest(format!(
+                "stale rewrapped data key for {} version {}: row changed since fetch",
+                secret.key, secret.version
+            )));
+        }
+        let expected_encrypted_data_key = secret.encrypted_data_key.clone();
         let mut rotated = secret;
         rotated.encrypted_data_key = encrypted_data_key;
         rotated.master_key_id = new_master_key_id;
         rotated.updated_at = time::OffsetDateTime::now_utc().unix_timestamp();
-        if let Err(err) = state.secret_repo.update_secret_master_key(&tx, &rotated) {
+        if let Err(err) = state.secret_repo.update_secret_master_key(
+            &tx,
+            &rotated,
+            &old_master_key_id,
+            &expected_encrypted_data_key,
+        ) {
             error!(
                 "Failed to update rewrapped data key for secret {}: {}",
                 rotated.key, err
@@ -330,28 +355,14 @@ fn rotate_for_namespace(
         }
     }
 
-    // Extra updates are tolerated only when their `(namespace, key, version)`
-    // is no longer in `secrets` (for example, a key expired between the
-    // client's fetch and this rotate request and was removed by cleanup).
-    // Any extra update referencing an existing row is rejected.
-    for (extra_namespace, extra_key, extra_version) in updates_by_secret.into_keys() {
-        if state.secret_repo.secret_version_exists(
-            &tx,
-            &extra_namespace,
-            &extra_key,
-            extra_version,
-        )? {
-            return Err(SealboxError::InvalidRequest(format!(
-                "unexpected rewrapped data key for {} version {}",
-                extra_key, extra_version
-            )));
-        }
-        warn!(
-            namespace = %extra_namespace,
-            key = %extra_key,
-            version = extra_version,
-            "Dropping rewrapped data key for secret no longer present during master key rotation"
-        );
+    // Reject the whole rotation if any supplied update did not match a fetched
+    // row under `old_master_key_id` (for example, a row expired, was deleted,
+    // or belongs to another master key). Because all updates run inside `tx`,
+    // nothing is mutated and the operator can safely retry rotation.
+    if let Some((_, extra_key, extra_version)) = updates_by_secret.into_keys().next() {
+        return Err(SealboxError::InvalidRequest(format!(
+            "unexpected or stale rewrapped data key for {extra_key} version {extra_version}: row is missing or changed since fetch"
+        )));
     }
 
     tx.execute(
@@ -798,6 +809,9 @@ mod tests {
                     namespace: principal.tenant_id.clone(),
                     key: "active".to_string(),
                     version: 1,
+                    previous_encrypted_data_key_sha256: encrypted_data_key_digest(
+                        &fetched_secrets[0].encrypted_data_key,
+                    ),
                     encrypted_data_key: vec![9, 9, 9],
                 }],
             }),
@@ -817,8 +831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rotate_drops_extra_updates_for_keys_expired_after_fetch_and_rejects_existing_extra_update()
-     {
+    async fn test_rotate_rejects_missing_or_unexpected_rows_and_succeeds_after_refetch() {
         let state = setup_test_state();
         let (_, first_public_pem) = generate_key_pair().expect("Should generate first key pair");
         let (_, second_public_pem) = generate_key_pair().expect("Should generate second key pair");
@@ -941,6 +954,9 @@ mod tests {
                 namespace: secret.namespace.clone(),
                 key: secret.key.clone(),
                 version: secret.version,
+                previous_encrypted_data_key_sha256: encrypted_data_key_digest(
+                    &secret.encrypted_data_key,
+                ),
                 encrypted_data_key: vec![7, 7, 7],
             })
             .collect();
@@ -951,6 +967,7 @@ mod tests {
             namespace: principal.tenant_id.clone(),
             key: "other-mk".to_string(),
             version: 1,
+            previous_encrypted_data_key_sha256: encrypted_data_key_digest(&[1, 2, 3]),
             encrypted_data_key: vec![8, 8, 8],
         });
         let err = rotate_v2(
@@ -965,13 +982,13 @@ mod tests {
         .await
         .expect_err("Extra update for existing row must be rejected");
         assert!(
-            matches!(err, SealboxError::InvalidRequest(ref msg) if msg.contains("unexpected rewrapped data key")),
+            matches!(err, SealboxError::InvalidRequest(ref msg) if msg.contains("unexpected or stale rewrapped data key")),
             "unexpected error: {err:?}"
         );
 
-        // Submitting the client's stale updates (including both rows of expiring-in-flight)
-        // succeeds: the expired rows were removed and their extra updates are dropped cleanly.
-        rotate_v2(
+        // Submitting the client's stale updates (containing rows that expired and were
+        // removed between fetch and rotate) must also reject the whole rotation cleanly.
+        let stale_err = rotate_v2(
             State(state.clone()),
             Extension(principal.clone()),
             Json(RotateMasterKeyPayload {
@@ -981,7 +998,51 @@ mod tests {
             }),
         )
         .await
-        .expect("Rotation should tolerate extra updates for rows removed by expiry cleanup");
+        .expect_err("Rotation must reject updates for rows missing after expiry cleanup");
+        assert!(
+            matches!(stale_err, SealboxError::InvalidRequest(ref msg) if msg.contains("unexpected or stale rewrapped data key")),
+            "unexpected error: {stale_err:?}"
+        );
+
+        // Re-fetching cleans up the expired key and retrying rotation succeeds cleanly.
+        let refreshed: Vec<crate::repo::Secret> = match secrets_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Path(TenantMasterKeyIdPathParams {
+                master_key_id: mk1.id,
+            }),
+        )
+        .await
+        .expect("Should re-fetch secrets")
+        {
+            SealboxResponse::Json(v) => {
+                serde_json::from_value(v.get("secrets").expect("Should have secrets").clone())
+                    .expect("Should parse secrets")
+            }
+            _ => panic!("Expected JSON"),
+        };
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].key, "active");
+
+        rotate_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Json(RotateMasterKeyPayload {
+                old_master_key_id: mk1.id,
+                new_master_key_id: mk2.id,
+                updates: vec![RewrappedSecretDataKey {
+                    namespace: refreshed[0].namespace.clone(),
+                    key: refreshed[0].key.clone(),
+                    version: refreshed[0].version,
+                    previous_encrypted_data_key_sha256: encrypted_data_key_digest(
+                        &refreshed[0].encrypted_data_key,
+                    ),
+                    encrypted_data_key: vec![7, 7, 7],
+                }],
+            }),
+        )
+        .await
+        .expect("Rotation should succeed after re-fetching live secrets");
 
         let conn = state.conn_pool.lock().expect("Should lock db");
         let remaining_expired: i64 = conn
@@ -1136,15 +1197,52 @@ mod tests {
             .expect("Should expire in-flight v2");
         }
 
-        let updates = fetched
+        let stale_updates = fetched
             .iter()
             .map(|secret| RewrappedSecretDataKey {
                 namespace: secret.namespace.clone(),
                 key: secret.key.clone(),
                 version: secret.version,
+                previous_encrypted_data_key_sha256: encrypted_data_key_digest(
+                    &secret.encrypted_data_key,
+                ),
                 encrypted_data_key: vec![5, 5, 5],
             })
             .collect();
+
+        // Stale V1 updates containing rows that expired after fetch must be rejected.
+        let err = rotate(
+            State(state.clone()),
+            Path(v1_path.clone()),
+            Json(RotateMasterKeyPayload {
+                old_master_key_id: mk1.id,
+                new_master_key_id: mk2.id,
+                updates: stale_updates,
+            }),
+        )
+        .await
+        .expect_err("V1 rotation must reject stale updates for missing expired rows");
+        assert!(matches!(err, SealboxError::InvalidRequest(_)));
+
+        // Re-fetching V1 secrets removes the expired key and retrying rotation succeeds.
+        let refreshed: Vec<crate::repo::Secret> = match secrets(
+            State(state.clone()),
+            Path(MasterKeyIdPathParams {
+                version: Version::V1,
+                master_key_id: mk1.id,
+            }),
+        )
+        .await
+        .expect("Should re-fetch v1 secrets")
+        {
+            SealboxResponse::Json(v) => {
+                serde_json::from_value(v.get("secrets").expect("Should have secrets").clone())
+                    .expect("Should parse secrets")
+            }
+            _ => panic!("Expected JSON"),
+        };
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].key, "v1-active");
 
         rotate(
             State(state.clone()),
@@ -1152,11 +1250,19 @@ mod tests {
             Json(RotateMasterKeyPayload {
                 old_master_key_id: mk1.id,
                 new_master_key_id: mk2.id,
-                updates,
+                updates: vec![RewrappedSecretDataKey {
+                    namespace: refreshed[0].namespace.clone(),
+                    key: refreshed[0].key.clone(),
+                    version: refreshed[0].version,
+                    previous_encrypted_data_key_sha256: encrypted_data_key_digest(
+                        &refreshed[0].encrypted_data_key,
+                    ),
+                    encrypted_data_key: vec![5, 5, 5],
+                }],
             }),
         )
         .await
-        .expect("V1 rotation should succeed after cleaning expired keys");
+        .expect("V1 rotation should succeed after re-fetching live secrets");
 
         let conn = state.conn_pool.lock().expect("Should lock db");
         let remaining_expired: i64 = conn
@@ -1171,5 +1277,427 @@ mod tests {
             )
             .expect("Should count expired rows");
         assert_eq!(remaining_expired, 0);
+    }
+
+    fn rewrap_for_rotation(
+        secrets: &[crate::repo::Secret],
+        old_private_pem: &str,
+        new_public_pem: &str,
+    ) -> Vec<RewrappedSecretDataKey> {
+        use crate::crypto::master_key::{PrivateMasterKey, PublicMasterKey};
+        use std::str::FromStr;
+
+        let old_priv = PrivateMasterKey::from_str(old_private_pem).expect("parse old private key");
+        let new_pub = PublicMasterKey::from_str(new_public_pem).expect("parse new public key");
+        secrets
+            .iter()
+            .map(|secret| {
+                let raw_data_key = old_priv
+                    .decrypt(&secret.encrypted_data_key)
+                    .expect("decrypt old data key");
+                let rewrapped = new_pub
+                    .encrypt(&raw_data_key)
+                    .expect("encrypt new data key");
+                RewrappedSecretDataKey {
+                    namespace: secret.namespace.clone(),
+                    key: secret.key.clone(),
+                    version: secret.version,
+                    previous_encrypted_data_key_sha256: encrypted_data_key_digest(
+                        &secret.encrypted_data_key,
+                    ),
+                    encrypted_data_key: rewrapped,
+                }
+            })
+            .collect()
+    }
+
+    fn decrypt_secret_plaintext(secret: &crate::repo::Secret, private_pem: &str) -> String {
+        use crate::crypto::{data_key::DataKey, master_key::PrivateMasterKey};
+        use std::str::FromStr;
+
+        let priv_key = PrivateMasterKey::from_str(private_pem).expect("parse private key");
+        let raw_data_key = priv_key
+            .decrypt(&secret.encrypted_data_key)
+            .expect("decrypt data key");
+        let data_key = DataKey::from_bytes(&raw_data_key).expect("valid data key");
+        let plaintext = data_key
+            .decrypt(&secret.encrypted_data)
+            .expect("decrypt secret payload");
+        String::from_utf8(plaintext).expect("valid utf-8")
+    }
+
+    async fn setup_rotation_pair(
+        state: &AppState,
+        principal: &TenantPrincipal,
+    ) -> (MasterKey, String, MasterKey, String) {
+        let (priv1, pub1) = generate_key_pair().expect("generate key pair 1");
+        let (priv2, pub2) = generate_key_pair().expect("generate key pair 2");
+
+        let mk1: MasterKey = match create_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Json(CreateMasterKeyPayload { public_key: pub1 }),
+        )
+        .await
+        .expect("create mk1")
+        {
+            SealboxResponse::Json(v) => serde_json::from_value(v).expect("parse mk1"),
+            _ => panic!("expected JSON"),
+        };
+        let mk2: MasterKey = match create_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Json(CreateMasterKeyPayload { public_key: pub2 }),
+        )
+        .await
+        .expect("create mk2")
+        {
+            SealboxResponse::Json(v) => serde_json::from_value(v).expect("parse mk2"),
+            _ => panic!("expected JSON"),
+        };
+        (mk1, priv1, mk2, priv2)
+    }
+
+    async fn fetch_mk_secrets(
+        state: &AppState,
+        principal: &TenantPrincipal,
+        mk_id: Uuid,
+    ) -> Vec<crate::repo::Secret> {
+        match secrets_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Path(TenantMasterKeyIdPathParams {
+                master_key_id: mk_id,
+            }),
+        )
+        .await
+        .expect("fetch secrets for master key")
+        {
+            SealboxResponse::Json(v) => {
+                serde_json::from_value(v.get("secrets").expect("secrets array").clone())
+                    .expect("parse secrets")
+            }
+            _ => panic!("expected JSON"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rotate_rejects_stale_update_after_expire_and_save() {
+        let state = setup_test_state();
+        let principal = TenantPrincipal {
+            tenant_id: "tenant-rot-expire-save".to_string(),
+            token_id: Uuid::new_v4(),
+        };
+        let (mk1, priv1, mk2, priv2) = setup_rotation_pair(&state, &principal).await;
+
+        {
+            let mut conn = state.conn_pool.lock().expect("lock db");
+            state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "cred",
+                    "old-v1",
+                    mk1.clone(),
+                    None,
+                )
+                .expect("create v1");
+            state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "cred",
+                    "old-v2-ttl",
+                    mk1.clone(),
+                    Some(3600),
+                )
+                .expect("create v2");
+        }
+
+        // Rotation client fetches and rewraps v1 and v2.
+        let fetched = fetch_mk_secrets(&state, &principal, mk1.id).await;
+        assert_eq!(fetched.len(), 2);
+        let stale_updates = rewrap_for_rotation(&fetched, &priv1, &mk2.public_key);
+
+        // Before PUT arrives: v2 expires, then a fresh value is saved (clears v1+v2, creates new v1).
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
+        {
+            let mut conn = state.conn_pool.lock().expect("lock db");
+            conn.execute(
+                "UPDATE secrets SET expires_at = ?1 WHERE namespace = ?2 AND key = ?3 AND version = 2",
+                (expired_at, &principal.tenant_id, "cred"),
+            )
+            .expect("expire v2");
+            let fresh = state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "cred",
+                    "fresh-after-expire",
+                    mk1.clone(),
+                    None,
+                )
+                .expect("save fresh value");
+            assert_eq!(fresh.version, 1);
+        }
+
+        // Stale rotation must be rejected so old v1's data key never overwrites fresh v1.
+        let err = rotate_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Json(RotateMasterKeyPayload {
+                old_master_key_id: mk1.id,
+                new_master_key_id: mk2.id,
+                updates: stale_updates,
+            }),
+        )
+        .await
+        .expect_err("expire+save during rotation must reject stale update");
+        assert!(
+            matches!(err, SealboxError::InvalidRequest(ref msg) if msg.contains("stale rewrapped data key")),
+            "unexpected error: {err:?}"
+        );
+
+        // Fresh value remains intact under mk1 and decrypts cleanly.
+        {
+            let mut conn = state.conn_pool.lock().expect("lock db");
+            let current = state
+                .secret_repo
+                .get_secret(&mut conn, &principal.tenant_id, "cred")
+                .expect("read fresh secret");
+            assert_eq!(current.version, 1);
+            assert_eq!(current.master_key_id, mk1.id);
+            assert_eq!(
+                decrypt_secret_plaintext(&current, &priv1),
+                "fresh-after-expire"
+            );
+            let active = state
+                .master_key_repo
+                .get_valid_master_key(&conn, &principal.tenant_id)
+                .expect("active master key");
+            assert_eq!(active.id, mk1.id);
+        }
+
+        // A retry that re-fetches and rewraps the fresh row succeeds and decrypts under mk2.
+        let refreshed = fetch_mk_secrets(&state, &principal, mk1.id).await;
+        assert_eq!(refreshed.len(), 1);
+        let fresh_updates = rewrap_for_rotation(&refreshed, &priv1, &mk2.public_key);
+        rotate_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Json(RotateMasterKeyPayload {
+                old_master_key_id: mk1.id,
+                new_master_key_id: mk2.id,
+                updates: fresh_updates,
+            }),
+        )
+        .await
+        .expect("retried rotation must succeed");
+        {
+            let mut conn = state.conn_pool.lock().expect("lock db");
+            let rotated = state
+                .secret_repo
+                .get_secret(&mut conn, &principal.tenant_id, "cred")
+                .expect("read rotated secret");
+            assert_eq!(rotated.master_key_id, mk2.id);
+            assert_eq!(
+                decrypt_secret_plaintext(&rotated, &priv2),
+                "fresh-after-expire"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rotate_rejects_stale_update_after_delete_and_save() {
+        let state = setup_test_state();
+        let principal = TenantPrincipal {
+            tenant_id: "tenant-rot-delete-save".to_string(),
+            token_id: Uuid::new_v4(),
+        };
+        let (mk1, priv1, mk2, _priv2) = setup_rotation_pair(&state, &principal).await;
+
+        // Test both single-version (equal count) and multi-version delete+save.
+        for (key, seed_second_version) in [("single-ver", false), ("multi-ver", true)] {
+            {
+                let mut conn = state.conn_pool.lock().expect("lock db");
+                state
+                    .secret_repo
+                    .create_new_version(
+                        &mut conn,
+                        &principal.tenant_id,
+                        key,
+                        "original-v1",
+                        mk1.clone(),
+                        None,
+                    )
+                    .expect("create v1");
+                if seed_second_version {
+                    state
+                        .secret_repo
+                        .create_new_version(
+                            &mut conn,
+                            &principal.tenant_id,
+                            key,
+                            "original-v2",
+                            mk1.clone(),
+                            None,
+                        )
+                        .expect("create v2");
+                }
+            }
+
+            let fetched = fetch_mk_secrets(&state, &principal, mk1.id).await;
+            let stale_updates = rewrap_for_rotation(&fetched, &priv1, &mk2.public_key);
+
+            {
+                let mut conn = state.conn_pool.lock().expect("lock db");
+                state
+                    .secret_repo
+                    .delete_secret(&conn, &principal.tenant_id, key)
+                    .expect("delete key");
+                let fresh = state
+                    .secret_repo
+                    .create_new_version(
+                        &mut conn,
+                        &principal.tenant_id,
+                        key,
+                        "fresh-after-delete",
+                        mk1.clone(),
+                        None,
+                    )
+                    .expect("re-save key");
+                assert_eq!(fresh.version, 1);
+            }
+
+            let err = rotate_v2(
+                State(state.clone()),
+                Extension(principal.clone()),
+                Json(RotateMasterKeyPayload {
+                    old_master_key_id: mk1.id,
+                    new_master_key_id: mk2.id,
+                    updates: stale_updates,
+                }),
+            )
+            .await
+            .expect_err("delete+save during rotation must reject stale update");
+            assert!(
+                matches!(err, SealboxError::InvalidRequest(ref msg) if msg.contains("stale rewrapped data key")),
+                "unexpected error for {key}: {err:?}"
+            );
+
+            let mut conn = state.conn_pool.lock().expect("lock db");
+            let current = state
+                .secret_repo
+                .get_secret(&mut conn, &principal.tenant_id, key)
+                .expect("read fresh secret");
+            assert_eq!(current.master_key_id, mk1.id);
+            assert_eq!(
+                decrypt_secret_plaintext(&current, &priv1),
+                "fresh-after-delete"
+            );
+            state
+                .secret_repo
+                .delete_secret(&conn, &principal.tenant_id, key)
+                .expect("clean key for next case");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rotate_rejects_stale_update_after_expire_read_and_save() {
+        let state = setup_test_state();
+        let principal = TenantPrincipal {
+            tenant_id: "tenant-rot-expire-read-save".to_string(),
+            token_id: Uuid::new_v4(),
+        };
+        let (mk1, priv1, mk2, _priv2) = setup_rotation_pair(&state, &principal).await;
+
+        {
+            let mut conn = state.conn_pool.lock().expect("lock db");
+            state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "cred",
+                    "old-permanent-v1",
+                    mk1.clone(),
+                    None,
+                )
+                .expect("create v1");
+            state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "cred",
+                    "old-temp-v2",
+                    mk1.clone(),
+                    Some(3600),
+                )
+                .expect("create v2");
+        }
+
+        let fetched = fetch_mk_secrets(&state, &principal, mk1.id).await;
+        assert_eq!(fetched.len(), 2);
+        let stale_updates = rewrap_for_rotation(&fetched, &priv1, &mk2.public_key);
+
+        // Expire v2, perform a read (which lazily removes both rows), then save a fresh value.
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
+        {
+            let mut conn = state.conn_pool.lock().expect("lock db");
+            conn.execute(
+                "UPDATE secrets SET expires_at = ?1 WHERE namespace = ?2 AND key = ?3 AND version = 2",
+                (expired_at, &principal.tenant_id, "cred"),
+            )
+            .expect("expire v2");
+            let read_err = state
+                .secret_repo
+                .get_secret(&mut conn, &principal.tenant_id, "cred")
+                .expect_err("read after expiry must return SecretNotFound");
+            assert!(matches!(read_err, SealboxError::SecretNotFound(_)));
+            let fresh = state
+                .secret_repo
+                .create_new_version(
+                    &mut conn,
+                    &principal.tenant_id,
+                    "cred",
+                    "fresh-after-expire-read",
+                    mk1.clone(),
+                    None,
+                )
+                .expect("save fresh value");
+            assert_eq!(fresh.version, 1);
+        }
+
+        let err = rotate_v2(
+            State(state.clone()),
+            Extension(principal.clone()),
+            Json(RotateMasterKeyPayload {
+                old_master_key_id: mk1.id,
+                new_master_key_id: mk2.id,
+                updates: stale_updates,
+            }),
+        )
+        .await
+        .expect_err("expire+read+save during rotation must reject stale update");
+        assert!(
+            matches!(err, SealboxError::InvalidRequest(ref msg) if msg.contains("stale rewrapped data key")),
+            "unexpected error: {err:?}"
+        );
+
+        let mut conn = state.conn_pool.lock().expect("lock db");
+        let current = state
+            .secret_repo
+            .get_secret(&mut conn, &principal.tenant_id, "cred")
+            .expect("read fresh secret");
+        assert_eq!(current.version, 1);
+        assert_eq!(current.master_key_id, mk1.id);
+        assert_eq!(
+            decrypt_secret_plaintext(&current, &priv1),
+            "fresh-after-expire-read"
+        );
     }
 }

@@ -675,15 +675,36 @@ impl SecretRepo for SqliteSecretRepo {
         info!("delete_secret_by_version");
         let tx = conn.transaction()?;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        // Version numbers restart at 1 once a key is removed (expired or
+        // deleted), so version numbers are not stable identifiers across a
+        // key's removal. Check whether the targeted row existed before
+        // per-key cleanup so deleting an already-expired older row under a
+        // live newest version still returns success (matching base behavior).
+        let target_existed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM secrets WHERE namespace = ?1 AND key = ?2 AND version = ?3)",
+            (namespace, key, version),
+            |row| row.get(0),
+        )?;
+
         Self::cleanup_expired_for_key(&tx, namespace, key, now)?;
 
         let changed = tx.execute(
             "DELETE FROM secrets WHERE namespace = ?1 AND key = ?2 AND version = ?3",
             (namespace, key, version),
         )?;
+        let key_still_live: bool = if changed == 0 && target_existed {
+            tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM secrets WHERE namespace = ?1 AND key = ?2)",
+                (namespace, key),
+                |row| row.get(0),
+            )?
+        } else {
+            false
+        };
         tx.commit()?;
 
-        if changed == 0 {
+        if changed == 0 && !(target_existed && key_still_live) {
             return Err(SealboxError::SecretNotFound(key.to_string()));
         }
         Ok(())
@@ -730,13 +751,23 @@ impl SecretRepo for SqliteSecretRepo {
         Ok(secrets)
     }
 
-    fn update_secret_master_key(&self, conn: &rusqlite::Connection, secret: &Secret) -> Result<()> {
-        conn.execute(
+    fn update_secret_master_key(
+        &self,
+        conn: &rusqlite::Connection,
+        secret: &Secret,
+        expected_master_key_id: &Uuid,
+        expected_encrypted_data_key: &[u8],
+    ) -> Result<()> {
+        let changed = conn.execute(
             "UPDATE secrets SET
                 encrypted_data_key = ?1,
                 master_key_id = ?2,
                 updated_at = ?3
-             WHERE namespace = ?4 AND key = ?5 AND version = ?6",
+             WHERE namespace = ?4
+               AND key = ?5
+               AND version = ?6
+               AND master_key_id = ?7
+               AND encrypted_data_key = ?8",
             rusqlite::params![
                 &secret.encrypted_data_key,
                 &secret.master_key_id,
@@ -744,23 +775,17 @@ impl SecretRepo for SqliteSecretRepo {
                 &secret.namespace,
                 &secret.key,
                 &secret.version,
+                expected_master_key_id,
+                expected_encrypted_data_key,
             ],
         )?;
+        if changed != 1 {
+            return Err(SealboxError::InvalidRequest(format!(
+                "stale or missing secret row for {} version {} during master key rotation",
+                secret.key, secret.version
+            )));
+        }
         Ok(())
-    }
-
-    fn secret_version_exists(
-        &self,
-        conn: &rusqlite::Connection,
-        namespace: &str,
-        key: &str,
-        version: i32,
-    ) -> Result<bool> {
-        let mut stmt = conn.prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM secrets WHERE namespace = ?1 AND key = ?2 AND version = ?3)",
-        )?;
-        let exists: bool = stmt.query_row((namespace, key, version), |row| row.get(0))?;
-        Ok(exists)
     }
 
     fn cleanup_expired_secrets(&self, conn: &rusqlite::Connection) -> Result<usize> {
@@ -1363,8 +1388,15 @@ mod tests {
         // Create a secret
         let mut conn_mut = conn;
         let mut secret = repo
-            .create_new_version(&mut conn_mut, "test-secret", "test-data", master_key, None)
+            .create_new_version(
+                &mut conn_mut,
+                "test-secret",
+                "test-data",
+                master_key.clone(),
+                None,
+            )
             .expect("Should create secret");
+        let original_encrypted_data_key = secret.encrypted_data_key.clone();
 
         // Modify the secret
         let new_master_key = create_test_master_key();
@@ -1372,9 +1404,20 @@ mod tests {
         secret.encrypted_data_key = vec![1, 2, 3, 4]; // Dummy new encrypted key
         secret.updated_at = time::OffsetDateTime::now_utc().unix_timestamp();
 
-        // Update in database
-        repo.update_secret_master_key(&conn_mut, &secret)
-            .expect("Should update secret");
+        // Mismatched expected wrapped data key must be rejected without modifying the row
+        let stale_err = repo
+            .update_secret_master_key(&conn_mut, &secret, &master_key.id, &[9, 9, 9])
+            .expect_err("Should reject stale expected_encrypted_data_key");
+        assert!(matches!(stale_err, SealboxError::InvalidRequest(_)));
+
+        // Update in database with the exact expected master key and wrapped data key
+        repo.update_secret_master_key(
+            &conn_mut,
+            &secret,
+            &master_key.id,
+            &original_encrypted_data_key,
+        )
+        .expect("Should update secret");
 
         // Verify the update
         let updated_secret = repo
@@ -2033,6 +2076,316 @@ mod tests {
                 Err(SealboxError::SecretNotFound(ref k)) if k == key
             ));
         }
+    }
+
+    #[test]
+    fn test_delete_secret_by_version_of_expired_older_row_under_live_newest_succeeds() {
+        let mut conn = setup_test_db();
+        let repo = SqliteSecretRepo;
+        let master_key = create_test_master_key();
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
+
+        let v1 = repo
+            .create_new_version(
+                &mut conn,
+                "active-with-expired-v1",
+                "v1-temp",
+                master_key.clone(),
+                Some(3600),
+            )
+            .expect("Should create v1");
+        let v2 = repo
+            .create_new_version(
+                &mut conn,
+                "active-with-expired-v1",
+                "v2-permanent",
+                master_key,
+                None,
+            )
+            .expect("Should create v2");
+        set_secret_expires_at(
+            &conn,
+            crate::repo::LEGACY_TENANT_ID,
+            "active-with-expired-v1",
+            v1.version,
+            Some(expired_at),
+        );
+
+        // Deleting an existing expired older version under a live newest version
+        // removes the row and returns Ok(()) while leaving v2 readable.
+        repo.delete_secret_by_version(&mut conn, "active-with-expired-v1", v1.version)
+            .expect("Deleting existing expired older version under live newest must succeed");
+        assert_eq!(
+            count_secret_rows(
+                &conn,
+                crate::repo::LEGACY_TENANT_ID,
+                "active-with-expired-v1"
+            ),
+            1
+        );
+        let current = repo
+            .get_secret(&mut conn, "active-with-expired-v1")
+            .expect("Live v2 must remain readable");
+        assert_eq!(current.version, v2.version);
+
+        // Deleting that same version a second time (row no longer exists) returns SecretNotFound.
+        let second_err = repo
+            .delete_secret_by_version(&mut conn, "active-with-expired-v1", v1.version)
+            .expect_err("Second delete of already-removed version must return SecretNotFound");
+        assert!(
+            matches!(second_err, SealboxError::SecretNotFound(ref k) if k == "active-with-expired-v1")
+        );
+    }
+
+    #[test]
+    fn test_same_key_name_cross_tenant_isolation_across_read_write_delete_and_cleanups() {
+        let mut conn = setup_test_db();
+        let repo = SqliteSecretRepo;
+        let mk_a = create_test_master_key();
+        let mk_b = create_test_master_key();
+        let expired_at = time::OffsetDateTime::now_utc().unix_timestamp() - 10;
+
+        let seed_expired_and_live_pair = |conn: &mut rusqlite::Connection, key: &str| {
+            // Tenant A: permanent v1 + expired TTL v2.
+            <SqliteSecretRepo as SecretRepo>::create_new_version(
+                &repo,
+                conn,
+                "tenant-a",
+                key,
+                "a-v1",
+                mk_a.clone(),
+                None,
+            )
+            .expect("Should create tenant-a v1");
+            let a_v2 = <SqliteSecretRepo as SecretRepo>::create_new_version(
+                &repo,
+                conn,
+                "tenant-a",
+                key,
+                "a-v2",
+                mk_a.clone(),
+                Some(3600),
+            )
+            .expect("Should create tenant-a v2");
+            set_secret_expires_at(conn, "tenant-a", key, a_v2.version, Some(expired_at));
+
+            // Tenant B: same key name and overlapping version numbers (v1, v2), both permanent.
+            <SqliteSecretRepo as SecretRepo>::create_new_version(
+                &repo,
+                conn,
+                "tenant-b",
+                key,
+                "b-v1",
+                mk_b.clone(),
+                None,
+            )
+            .expect("Should create tenant-b v1");
+            <SqliteSecretRepo as SecretRepo>::create_new_version(
+                &repo,
+                conn,
+                "tenant-b",
+                key,
+                "b-v2",
+                mk_b.clone(),
+                None,
+            )
+            .expect("Should create tenant-b v2");
+        };
+
+        // 1. Read path (get_secret and get_secret_by_version) in tenant A leaves tenant B untouched.
+        seed_expired_and_live_pair(&mut conn, "shared-read");
+        assert!(matches!(
+            <SqliteSecretRepo as SecretRepo>::get_secret(
+                &repo,
+                &mut conn,
+                "tenant-a",
+                "shared-read"
+            ),
+            Err(SealboxError::SecretNotFound(_))
+        ));
+        assert_eq!(count_secret_rows(&conn, "tenant-a", "shared-read"), 0);
+        assert_eq!(count_secret_rows(&conn, "tenant-b", "shared-read"), 2);
+        assert_eq!(
+            <SqliteSecretRepo as SecretRepo>::get_secret(
+                &repo,
+                &mut conn,
+                "tenant-b",
+                "shared-read"
+            )
+            .expect("Tenant B shared-read must remain readable")
+            .version,
+            2
+        );
+
+        seed_expired_and_live_pair(&mut conn, "shared-read-ver");
+        assert!(matches!(
+            <SqliteSecretRepo as SecretRepo>::get_secret_by_version(
+                &repo,
+                &mut conn,
+                "tenant-a",
+                "shared-read-ver",
+                1
+            ),
+            Err(SealboxError::SecretNotFound(_))
+        ));
+        assert_eq!(count_secret_rows(&conn, "tenant-a", "shared-read-ver"), 0);
+        assert_eq!(count_secret_rows(&conn, "tenant-b", "shared-read-ver"), 2);
+
+        // 2. Write path (create_new_encrypted_version) in tenant A leaves tenant B untouched.
+        seed_expired_and_live_pair(&mut conn, "shared-write");
+        let saved_a = <SqliteSecretRepo as SecretRepo>::create_new_encrypted_version(
+            &repo,
+            &mut conn,
+            "tenant-a",
+            "shared-write",
+            EncryptedSecretInput {
+                encrypted_data: vec![7, 7],
+                encrypted_data_key: vec![8, 8],
+                master_key_id: mk_a.id,
+                ttl: None,
+                metadata: None,
+            },
+        )
+        .expect("Should save replacement in tenant-a");
+        assert_eq!(saved_a.version, 1);
+        assert_eq!(count_secret_rows(&conn, "tenant-a", "shared-write"), 1);
+        assert_eq!(count_secret_rows(&conn, "tenant-b", "shared-write"), 2);
+        assert_eq!(
+            <SqliteSecretRepo as SecretRepo>::get_secret(
+                &repo,
+                &mut conn,
+                "tenant-b",
+                "shared-write"
+            )
+            .expect("Tenant B shared-write must remain intact")
+            .version,
+            2
+        );
+
+        // 3. Version delete path in tenant A leaves tenant B untouched.
+        seed_expired_and_live_pair(&mut conn, "shared-delete-ver");
+        assert!(matches!(
+            <SqliteSecretRepo as SecretRepo>::delete_secret_by_version(
+                &repo,
+                &mut conn,
+                "tenant-a",
+                "shared-delete-ver",
+                2
+            ),
+            Err(SealboxError::SecretNotFound(_))
+        ));
+        assert_eq!(count_secret_rows(&conn, "tenant-a", "shared-delete-ver"), 0);
+        assert_eq!(count_secret_rows(&conn, "tenant-b", "shared-delete-ver"), 2);
+
+        // 4. Per-tenant cleanup in tenant A leaves tenant B's same-named active AND expired keys untouched.
+        seed_expired_and_live_pair(&mut conn, "shared-ns-cleanup");
+        <SqliteSecretRepo as SecretRepo>::create_new_version(
+            &repo,
+            &mut conn,
+            "tenant-a",
+            "shared-both-expired",
+            "a-v1",
+            mk_a.clone(),
+            Some(3600),
+        )
+        .expect("Should create tenant-a expired");
+        set_secret_expires_at(
+            &conn,
+            "tenant-a",
+            "shared-both-expired",
+            1,
+            Some(expired_at),
+        );
+        <SqliteSecretRepo as SecretRepo>::create_new_version(
+            &repo,
+            &mut conn,
+            "tenant-b",
+            "shared-both-expired",
+            "b-v1",
+            mk_b.clone(),
+            Some(3600),
+        )
+        .expect("Should create tenant-b expired");
+        set_secret_expires_at(
+            &conn,
+            "tenant-b",
+            "shared-both-expired",
+            1,
+            Some(expired_at),
+        );
+
+        let ns_deleted = repo
+            .cleanup_expired_secrets_in_namespace(&conn, "tenant-a")
+            .expect("Should clean tenant-a");
+        assert_eq!(ns_deleted, 3);
+        assert_eq!(count_secret_rows(&conn, "tenant-a", "shared-ns-cleanup"), 0);
+        assert_eq!(
+            count_secret_rows(&conn, "tenant-a", "shared-both-expired"),
+            0
+        );
+        assert_eq!(count_secret_rows(&conn, "tenant-b", "shared-ns-cleanup"), 2);
+        assert_eq!(
+            count_secret_rows(&conn, "tenant-b", "shared-both-expired"),
+            1
+        );
+
+        // 5. All-tenant cleanup removes tenant A's expired same-named key (and tenant B's
+        //    expired key) without touching tenant B's active same-named key with overlapping
+        //    version numbers (catches missing namespace in PARTITION BY and outer DELETE).
+        for (data, ttl) in [("a-v1", None), ("a-v2", None), ("a-v3", Some(3600))] {
+            <SqliteSecretRepo as SecretRepo>::create_new_version(
+                &repo,
+                &mut conn,
+                "tenant-a",
+                "shared-all-cleanup",
+                data,
+                mk_a.clone(),
+                ttl,
+            )
+            .expect("Should create tenant-a shared-all-cleanup version");
+        }
+        set_secret_expires_at(&conn, "tenant-a", "shared-all-cleanup", 3, Some(expired_at));
+        for data in ["b-v1", "b-v2"] {
+            <SqliteSecretRepo as SecretRepo>::create_new_version(
+                &repo,
+                &mut conn,
+                "tenant-b",
+                "shared-all-cleanup",
+                data,
+                mk_b.clone(),
+                None,
+            )
+            .expect("Should create tenant-b shared-all-cleanup version");
+        }
+
+        let all_deleted = repo
+            .cleanup_expired_secrets(&conn)
+            .expect("Should clean all tenants");
+        // 3 rows from tenant-a/shared-all-cleanup + 1 row from tenant-b/shared-both-expired = 4.
+        assert_eq!(all_deleted, 4);
+        assert_eq!(
+            count_secret_rows(&conn, "tenant-a", "shared-all-cleanup"),
+            0
+        );
+        assert_eq!(
+            count_secret_rows(&conn, "tenant-b", "shared-both-expired"),
+            0
+        );
+        assert_eq!(
+            count_secret_rows(&conn, "tenant-b", "shared-all-cleanup"),
+            2
+        );
+        assert_eq!(
+            <SqliteSecretRepo as SecretRepo>::get_secret(
+                &repo,
+                &mut conn,
+                "tenant-b",
+                "shared-all-cleanup"
+            )
+            .expect("Tenant B shared-all-cleanup must survive all-tenant cleanup")
+            .version,
+            2
+        );
     }
 
     #[test]
