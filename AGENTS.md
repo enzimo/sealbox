@@ -239,11 +239,11 @@ The `/v1/...` routes use the root token against the `legacy` tenant. They are of
 - ✅ Complete CLI architecture with robust configuration management
 - ✅ Full key management command set (generate, register, list, rotate, status)
 - ✅ Secret management with client-side encryption and client-side decryption
-- ✅ **TTL (Time-To-Live) support** - Lazy cleanup with automatic expiration
-  - Secrets can be created with optional TTL (time in seconds)
-  - Expired secrets are automatically deleted when accessed
-  - Manual cleanup API for batch removal of expired secrets
-  - Startup cleanup removes expired secrets on server restart
+- ✅ **TTL (Time-To-Live) support** - Whole-key expiry with lazy, startup, and manual cleanup
+  - Secrets, credentials, and files can be created with optional TTL (time in seconds)
+  - A key's expiry is decided by its newest version: once the newest version passes `expires_at`, the whole key is gone (reads by key or older version delete all versions and return `404`; listings and history omit it; no fallback to superseded older versions). Expired older versions under an unexpired newest version are still removed on their own.
+  - Manual cleanup API/CLI (`sealbox-cli secret cleanup-expired`, `DELETE /v2/cleanup-expired`, `DELETE /v2/admin/cleanup-expired`) for batch removal of expired keys and expired older versions (`deleted_count` counts every removed row)
+  - Startup cleanup removes expired keys and expired older versions on server restart
 - ✅ Batch operations (import/export functionality framework)
 - ✅ **Complete internationalization (i18n)** - Full multi-language support
   - **4 languages supported**: English (default), Chinese (中文), Japanese (日本語), German (Deutsch)

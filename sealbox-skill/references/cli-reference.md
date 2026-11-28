@@ -86,14 +86,16 @@ This covers behavior and intent for command usage. Prefer exact option names fro
 ### Expiring secret
 
 1. `sealbox-cli secret set temp/token --ttl 3600`
-2. After duration, expired records remain until read, server startup, or manual cleanup.
-3. Run `sealbox-cli secret cleanup-expired` (or `SEALBOX_TOKEN_FILE=/path/to/tenant_token sealbox-cli secret cleanup-expired --output json` for scripts) to delete all expired secrets, credentials, and files for the calling tenant without needing local key files. Cleanup removes only expired versions; older versions without expiry stay and the newest of them becomes current. `deleted_count` reports removed versions (rows), and the root token is rejected with `401`.
+2. A key's expiry is decided by its newest version (highest version number). A value written with a TTL replaces the key until it expires; once that newest version expires, the entire key is gone—reads by key or older version return `404` and delete all versions, and listings/history omit it instead of silently reviving a superseded older version (which is unsafe for credentials). An expired older version under a newer, unexpired version is still removed on its own.
+3. Expired rows remain on disk until read, server startup, or manual cleanup (though listings and history omit expired keys immediately).
+4. Run `sealbox-cli secret cleanup-expired` (or `SEALBOX_TOKEN_FILE=/path/to/tenant_token sealbox-cli secret cleanup-expired --output json` for scripts) to delete every version of expired secrets, credentials, and files (plus expired older versions under active keys) for the calling tenant without needing local key files. `deleted_count` reports every removed version row, and the root token is rejected with `401`.
 
 ### Bulk operations
 
 - `sealbox-cli secret export backup.sealbox`
 - `sealbox-cli secret import backup.sealbox`
 - Import/export supports Sealbox archival formats used for migration and backup.
+- On `secret import`, if a key's newest archived version has expired, every archived version of that key is skipped so older superseded versions are never revived. Under an unexpired newest archived version, individual expired older versions are still skipped.
 
 ### Tenant onboarding
 

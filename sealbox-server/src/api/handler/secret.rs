@@ -168,11 +168,11 @@ pub(crate) async fn delete(
 ) -> Result<SealboxResponse> {
     match params.version() {
         Version::V1 => {
-            let conn = state.conn_pool.lock()?;
+            let mut conn = state.conn_pool.lock()?;
             match query.version {
                 Some(version) => {
                     state.secret_repo.delete_secret_by_version(
-                        &conn,
+                        &mut conn,
                         LEGACY_TENANT_ID,
                         &params.secret_key(),
                         version,
@@ -331,10 +331,10 @@ pub(crate) async fn delete_v2(
     Path(params): Path<TenantSecretPathParams>,
     Query(query): Query<DeleteSecretQueryParams>,
 ) -> Result<SealboxResponse> {
-    let conn = state.conn_pool.lock()?;
+    let mut conn = state.conn_pool.lock()?;
     match query.version {
         Some(version) => state.secret_repo.delete_secret_by_version(
-            &conn,
+            &mut conn,
             &principal.tenant_id,
             &params.secret_key,
             version,

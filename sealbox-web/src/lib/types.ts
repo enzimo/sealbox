@@ -56,6 +56,7 @@ export interface RewrappedSecretDataKey {
   namespace: string;
   key: string;
   version: number;
+  previous_encrypted_data_key_sha256: string;
   encrypted_data_key: number[];
 }
 

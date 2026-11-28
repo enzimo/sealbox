@@ -7,7 +7,11 @@ use crate::{
     repo::backup_database,
 };
 
-/// API handler for cleaning up expired secrets in every tenant
+/// API handler for cleaning up expired secrets in every tenant.
+///
+/// Removes every version of any key whose newest version has expired, plus
+/// expired older versions under unexpired newest versions. `deleted_count`
+/// counts every version row removed.
 ///
 /// # Arguments
 ///

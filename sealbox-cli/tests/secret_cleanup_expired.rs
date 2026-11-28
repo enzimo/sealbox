@@ -18,7 +18,7 @@ use tokio::process::Command;
 
 const CLI_BIN: &str = env!("CARGO_BIN_EXE_sealbox-cli");
 const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
-const EXPIRY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const EXPIRY_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 struct CliOutput {
     code: Option<i32>,
@@ -924,7 +924,7 @@ async fn cleanup_expired_exits_1_with_empty_stdout_on_500_and_non_json_200() {
 }
 
 #[tokio::test]
-async fn cleanup_expired_counts_versions_and_falls_back_to_permanent_version() {
+async fn cleanup_expired_ends_whole_key_for_expired_newest_and_prunes_older_expired_versions() {
     let server = LiveServer::start();
     let (tenant_id, token) = server.create_tenant("Tenant MultiVersion").await;
     let home = tempfile::tempdir().expect("tenant home");
@@ -935,70 +935,155 @@ async fn cleanup_expired_counts_versions_and_falls_back_to_permanent_version() {
         ("SEALBOX_TOKEN", token.as_str()),
     ];
 
-    // Key with permanent v1 and expiring v2: cleanup should remove only v2 so v1 becomes current.
+    let perm_file = home.path().join("perm.txt");
+    let temp_file = home.path().join("temp.txt");
+    fs::write(&perm_file, b"permanent file v1").expect("write perm file");
+    fs::write(&temp_file, b"ephemeral file v2").expect("write temp file");
+    let perm_file_str = perm_file.to_str().expect("utf-8 perm file path");
+    let temp_file_str = temp_file.to_str().expect("utf-8 temp file path");
+
+    // 1. Plain secret, credential, and file each with permanent v1 + expiring v2.
     run_cli(
         home.path(),
         &envs,
-        &["secret", "set", "fallback-key", "permanent-v1"],
+        &["secret", "set", "ended-secret", "permanent-v1"],
     )
     .await
-    .assert_success("set fallback-key v1");
+    .assert_success("set ended-secret v1");
     run_cli(
         home.path(),
         &envs,
         &[
             "secret",
             "set",
-            "fallback-key",
+            "ended-secret",
             "ephemeral-v2",
             "--ttl",
             "1",
         ],
     )
     .await
-    .assert_success("set fallback-key v2");
+    .assert_success("set ended-secret v2");
 
-    // Key with two expiring versions: both rows should count toward deleted_count.
+    run_cli(
+        home.path(),
+        &envs,
+        &[
+            "credential",
+            "set",
+            "ended-cred",
+            "--username",
+            "perm-user",
+            "--generate-password",
+        ],
+    )
+    .await
+    .assert_success("set ended-cred v1");
+    run_cli(
+        home.path(),
+        &envs,
+        &[
+            "credential",
+            "set",
+            "ended-cred",
+            "--username",
+            "temp-user",
+            "--ttl",
+            "1",
+            "--generate-password",
+        ],
+    )
+    .await
+    .assert_success("set ended-cred v2");
+
+    run_cli(
+        home.path(),
+        &envs,
+        &["file", "set", "ended-file", "--file", perm_file_str],
+    )
+    .await
+    .assert_success("set ended-file v1");
+    run_cli(
+        home.path(),
+        &envs,
+        &[
+            "file",
+            "set",
+            "ended-file",
+            "--file",
+            temp_file_str,
+            "--ttl",
+            "1",
+        ],
+    )
+    .await
+    .assert_success("set ended-file v2");
+
+    // 2. Active secret with expiring v1 under permanent v2: only v1 should be removed.
     run_cli(
         home.path(),
         &envs,
         &[
             "secret",
             "set",
-            "multi-expired-key",
+            "active-with-expired-v1",
             "expired-v1",
             "--ttl",
             "1",
         ],
     )
     .await
-    .assert_success("set multi-expired-key v1");
+    .assert_success("set active-with-expired-v1 v1");
     run_cli(
         home.path(),
         &envs,
-        &[
-            "secret",
-            "set",
-            "multi-expired-key",
-            "expired-v2",
-            "--ttl",
-            "1",
-        ],
+        &["secret", "set", "active-with-expired-v1", "permanent-v2"],
     )
     .await
-    .assert_success("set multi-expired-key v2");
+    .assert_success("set active-with-expired-v1 v2");
 
-    assert_eq!(server.row_count(&tenant_id, "fallback-key"), 2);
-    assert_eq!(server.row_count(&tenant_id, "multi-expired-key"), 2);
+    assert_eq!(server.row_count(&tenant_id, "ended-secret"), 2);
+    assert_eq!(server.row_count(&tenant_id, "ended-cred"), 2);
+    assert_eq!(server.row_count(&tenant_id, "ended-file"), 2);
+    assert_eq!(server.row_count(&tenant_id, "active-with-expired-v1"), 2);
 
     // Wait past expiry without calling `secret get` first so lazy cleanup cannot mask the result.
     server
         .wait_until_expired(&[
-            (&tenant_id, "fallback-key"),
-            (&tenant_id, "multi-expired-key"),
+            (&tenant_id, "ended-secret"),
+            (&tenant_id, "ended-cred"),
+            (&tenant_id, "ended-file"),
+            (&tenant_id, "active-with-expired-v1"),
         ])
         .await;
 
+    // Even before cleanup runs, listings and version history already omit expired-newest keys.
+    let list_before = run_cli(home.path(), &envs, &["secret", "list", "--output", "json"]).await;
+    list_before.assert_success("list before cleanup");
+    assert!(!list_before.stdout.contains("ended-secret"));
+    assert!(!list_before.stdout.contains("ended-cred"));
+    assert!(!list_before.stdout.contains("ended-file"));
+    assert!(list_before.stdout.contains("active-with-expired-v1"));
+
+    let history_before = run_cli(
+        home.path(),
+        &envs,
+        &["secret", "history", "ended-secret", "--output", "json"],
+    )
+    .await;
+    assert_eq!(
+        history_before.code,
+        Some(1),
+        "stderr: {}",
+        history_before.stderr
+    );
+    assert!(
+        history_before.stderr.contains("404"),
+        "expected 404 for ended-secret history, got: {}",
+        history_before.stderr
+    );
+
+    // Tenant cleanup deletes all 2 versions of each ended key (6 rows) + expired v1 of active key (1 row) = 7.
     let janitor_home = tempfile::tempdir().expect("janitor home");
     let cleanup = run_cli(
         janitor_home.path(),
@@ -1014,20 +1099,315 @@ async fn cleanup_expired_counts_versions_and_falls_back_to_permanent_version() {
     );
 
     let (deleted_count, _) = parse_cleanup_json(&cleanup.stdout);
-    assert_eq!(deleted_count, 3);
-    assert_eq!(server.row_count(&tenant_id, "fallback-key"), 1);
-    assert_eq!(server.row_count(&tenant_id, "multi-expired-key"), 0);
+    assert_eq!(deleted_count, 7);
+    assert_eq!(server.row_count(&tenant_id, "ended-secret"), 0);
+    assert_eq!(server.row_count(&tenant_id, "ended-cred"), 0);
+    assert_eq!(server.row_count(&tenant_id, "ended-file"), 0);
+    assert_eq!(server.row_count(&tenant_id, "active-with-expired-v1"), 1);
 
-    let fallback = run_cli(
+    // Reading ended keys by key or by older version fails with 404; active key still returns permanent v2.
+    let get_ended_latest = run_cli(home.path(), &envs, &["secret", "get", "ended-secret"]).await;
+    assert_eq!(
+        get_ended_latest.code,
+        Some(1),
+        "stderr: {}",
+        get_ended_latest.stderr
+    );
+    assert!(
+        get_ended_latest.stderr.contains("404"),
+        "stderr: {}",
+        get_ended_latest.stderr
+    );
+
+    let get_ended_v1 = run_cli(
         home.path(),
         &envs,
-        &["secret", "get", "fallback-key", "--output", "json"],
+        &["secret", "get", "ended-secret", "--version", "1"],
     )
     .await;
-    fallback.assert_success("get fallback-key after cleanup");
-    let fallback_json = parse_secret_get_json(&fallback.stdout);
-    assert_eq!(fallback_json["value"], "permanent-v1");
-    assert_eq!(fallback_json["version"], 1);
+    assert_eq!(
+        get_ended_v1.code,
+        Some(1),
+        "stderr: {}",
+        get_ended_v1.stderr
+    );
+    assert!(
+        get_ended_v1.stderr.contains("404"),
+        "stderr: {}",
+        get_ended_v1.stderr
+    );
+
+    let get_ended_cred = run_cli(home.path(), &envs, &["credential", "get", "ended-cred"]).await;
+    assert_eq!(
+        get_ended_cred.code,
+        Some(1),
+        "stderr: {}",
+        get_ended_cred.stderr
+    );
+    assert!(
+        get_ended_cred.stderr.contains("404"),
+        "stderr: {}",
+        get_ended_cred.stderr
+    );
+
+    let get_ended_file = run_cli(
+        home.path(),
+        &envs,
+        &[
+            "file",
+            "get",
+            "ended-file",
+            "--file",
+            home.path().join("restored.txt").to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert_eq!(
+        get_ended_file.code,
+        Some(1),
+        "stderr: {}",
+        get_ended_file.stderr
+    );
+    assert!(
+        get_ended_file.stderr.contains("404"),
+        "stderr: {}",
+        get_ended_file.stderr
+    );
+
+    let active = run_cli(
+        home.path(),
+        &envs,
+        &[
+            "secret",
+            "get",
+            "active-with-expired-v1",
+            "--output",
+            "json",
+        ],
+    )
+    .await;
+    active.assert_success("get active-with-expired-v1 after cleanup");
+    let active_json = parse_secret_get_json(&active.stdout);
+    assert_eq!(active_json["value"], "permanent-v2");
+    assert_eq!(active_json["version"], 2);
+}
+
+#[tokio::test]
+async fn read_and_import_do_not_revive_expired_newest_version() {
+    let server = LiveServer::start();
+    let (tenant_a, token_a) = server.create_tenant("Tenant Source").await;
+    let (tenant_b, token_b) = server.create_tenant("Tenant Dest").await;
+
+    let home_a = tempfile::tempdir().expect("home a");
+    let home_b = tempfile::tempdir().expect("home b");
+    setup_tenant_keys(&server, home_a.path(), &token_a).await;
+    setup_tenant_keys(&server, home_b.path(), &token_b).await;
+
+    let envs_a = [
+        ("SEALBOX_URL", server.base_url.as_str()),
+        ("SEALBOX_TOKEN", token_a.as_str()),
+    ];
+    let envs_b = [
+        ("SEALBOX_URL", server.base_url.as_str()),
+        ("SEALBOX_TOKEN", token_b.as_str()),
+    ];
+
+    // Permanent control key, plus permanent v1 + expiring v2 for ephemeral-override.
+    // Create still-active first so only the single export command runs inside v2's TTL window.
+    run_cli(
+        home_a.path(),
+        &envs_a,
+        &["secret", "set", "still-active", "keep-me"],
+    )
+    .await
+    .assert_success("set still-active");
+    run_cli(
+        home_a.path(),
+        &envs_a,
+        &["secret", "set", "ephemeral-override", "old-permanent-v1"],
+    )
+    .await
+    .assert_success("set ephemeral-override v1");
+    run_cli(
+        home_a.path(),
+        &envs_a,
+        &[
+            "secret",
+            "set",
+            "ephemeral-override",
+            "temp-v2",
+            "--ttl",
+            "8",
+        ],
+    )
+    .await
+    .assert_success("set ephemeral-override v2");
+
+    // Export --all-versions while v2 is still valid and verify all 3 versions were archived.
+    let archive_path = home_a.path().join("backup.sealbox");
+    let passphrase_file = home_a.path().join("passphrase.txt");
+    fs::write(&passphrase_file, "test-archive-passphrase\n").expect("write passphrase");
+    let export_out = run_cli(
+        home_a.path(),
+        &envs_a,
+        &[
+            "secret",
+            "export",
+            archive_path.to_str().unwrap(),
+            "--all-versions",
+            "--passphrase-file",
+            passphrase_file.to_str().unwrap(),
+        ],
+    )
+    .await;
+    export_out.assert_success("export --all-versions before expiry");
+    assert!(
+        export_out
+            .stdout
+            .contains("Exported 3 secret versions across 2 keys"),
+        "expected archive to contain both versions of ephemeral-override plus still-active, got:\n{}",
+        export_out.stdout
+    );
+
+    // Wait until ephemeral-override v2 has expired.
+    server
+        .wait_until_expired(&[(&tenant_a, "ephemeral-override")])
+        .await;
+
+    // 1. Reading the older version through the CLI returns 404 and deletes all rows.
+    let get_old_v1 = run_cli(
+        home_a.path(),
+        &envs_a,
+        &["secret", "get", "ephemeral-override", "--version", "1"],
+    )
+    .await;
+    assert_eq!(get_old_v1.code, Some(1), "stderr: {}", get_old_v1.stderr);
+    assert!(
+        get_old_v1.stderr.contains("404"),
+        "stderr: {}",
+        get_old_v1.stderr
+    );
+    assert_eq!(server.row_count(&tenant_a, "ephemeral-override"), 0);
+
+    // 2. Importing the pre-expiry archive into Tenant B skips every version of
+    //    ephemeral-override (never reviving old-permanent-v1) while importing still-active.
+    let import_out = run_cli(
+        home_b.path(),
+        &envs_b,
+        &[
+            "secret",
+            "import",
+            archive_path.to_str().unwrap(),
+            "--passphrase-file",
+            passphrase_file.to_str().unwrap(),
+        ],
+    )
+    .await;
+    import_out.assert_success("import pre-expiry archive after expiry");
+    assert!(
+        import_out
+            .stdout
+            .contains("Skipping expired secret 'ephemeral-override'"),
+        "expected import warning for ephemeral-override, got:\n{}",
+        import_out.stdout
+    );
+    assert!(
+        import_out.stdout.contains("2 version(s) skipped"),
+        "expected import warning to report 2 skipped versions, got:\n{}",
+        import_out.stdout
+    );
+    assert!(
+        import_out
+            .stdout
+            .contains("Imported: 1, skipped expired: 2"),
+        "expected import summary to report 1 imported and 2 skipped, got:\n{}",
+        import_out.stdout
+    );
+    assert_eq!(server.row_count(&tenant_b, "ephemeral-override"), 0);
+    assert_eq!(server.row_count(&tenant_b, "still-active"), 1);
+
+    let imported_active = run_cli(
+        home_b.path(),
+        &envs_b,
+        &["secret", "get", "still-active", "--output", "json"],
+    )
+    .await;
+    imported_active.assert_success("get imported still-active");
+    let active_json = parse_secret_get_json(&imported_active.stdout);
+    assert_eq!(active_json["value"], "keep-me");
+}
+
+#[tokio::test]
+async fn cli_key_rotate_rewraps_with_row_digest_and_secret_decrypts_under_new_key() {
+    let server = LiveServer::start();
+    let (_tenant_id, token) = server.create_tenant("Tenant Rotate").await;
+    let home_old = tempfile::tempdir().expect("home old");
+    let home_new = tempfile::tempdir().expect("home new");
+    let envs = [
+        ("SEALBOX_URL", server.base_url.as_str()),
+        ("SEALBOX_TOKEN", token.as_str()),
+    ];
+
+    // Generate and register key 1 (Active), then store a secret.
+    setup_tenant_keys(&server, home_old.path(), &token).await;
+    run_cli(
+        home_old.path(),
+        &envs,
+        &["secret", "set", "rotated-secret", "roundtrip-value"],
+    )
+    .await
+    .assert_success("set rotated-secret");
+
+    // Generate and register key 2 (Retired).
+    setup_tenant_keys(&server, home_new.path(), &token).await;
+
+    // List keys to find old (Active) and new (Retired) master key IDs.
+    let list_out = run_cli(home_old.path(), &envs, &["key", "list", "--output", "json"]).await;
+    list_out.assert_success("key list");
+    let json_start = list_out.stdout.find('[').expect("JSON array in key list");
+    let keys: Vec<Value> =
+        serde_json::from_str(&list_out.stdout[json_start..]).expect("parse keys");
+    let old_key_id = keys
+        .iter()
+        .find(|k| k["status"] == "Active")
+        .expect("active key")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let new_key_id = keys
+        .iter()
+        .find(|k| k["status"] == "Retired")
+        .expect("retired key")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Rotate from old -> new using the old private key in home_old.
+    run_cli(
+        home_old.path(),
+        &envs,
+        &[
+            "key",
+            "rotate",
+            "--old-key-id",
+            &old_key_id,
+            "--new-key-id",
+            &new_key_id,
+        ],
+    )
+    .await
+    .assert_success("key rotate");
+
+    // Decrypt the rotated secret using the new private key in home_new.
+    let get_out = run_cli(
+        home_new.path(),
+        &envs,
+        &["secret", "get", "rotated-secret", "--output", "json"],
+    )
+    .await;
+    get_out.assert_success("get rotated-secret under new key");
+    let secret_json = parse_secret_get_json(&get_out.stdout);
+    assert_eq!(secret_json["value"], "roundtrip-value");
 }
 
 #[tokio::test]

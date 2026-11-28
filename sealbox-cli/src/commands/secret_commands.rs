@@ -23,6 +23,24 @@ use super::{input::read_secret_from_tty_or_stdin, secret_archive};
 const CLEANUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Typed error returned when the server answers HTTP 404 for a secret or its
+/// version history, allowing callers like `secret export` to distinguish an
+/// expired/removed key from transport or server errors without matching text.
+#[derive(Debug)]
+pub(crate) struct SecretNotFoundError(String);
+
+impl std::fmt::Display for SecretNotFoundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SecretNotFoundError {}
+
+pub(crate) fn is_secret_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<SecretNotFoundError>().is_some()
+}
+
 pub struct DecryptedSecret {
     pub key: String,
     pub value: String,
@@ -364,11 +382,14 @@ pub async fn fetch_decrypted_secret_bytes(
             .text()
             .await
             .unwrap_or_else(|_| "Unable to get error information".to_string());
-        anyhow::bail!(
+        let message = format!(
             "Server returned error (status code: {}):\n{}",
-            status,
-            error_body
+            status, error_body
         );
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(SecretNotFoundError(message).into());
+        }
+        anyhow::bail!("{message}");
     }
 
     let secret_data: Secret = response
@@ -524,11 +545,14 @@ pub async fn fetch_secret_history(config: &Config, key: &str) -> Result<Vec<Secr
             .text()
             .await
             .unwrap_or_else(|_| "Unable to get error information".to_string());
-        anyhow::bail!(
+        let message = format!(
             "Server returned error (status code: {}):\n{}",
-            status,
-            error_body
+            status, error_body
         );
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(SecretNotFoundError(message).into());
+        }
+        anyhow::bail!("{message}");
     }
 
     let result: SecretHistoryResponse = response
