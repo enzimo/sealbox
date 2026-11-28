@@ -182,12 +182,16 @@ impl Config {
         )
     }
 
-    pub fn admin_url(&self, path: &str) -> String {
+    pub fn v2_url(&self, path: &str) -> String {
         format!(
-            "{}/v2/admin/{}",
+            "{}/v2/{}",
             self.server.url.trim_end_matches('/'),
             path.trim_start_matches('/')
         )
+    }
+
+    pub fn admin_url(&self, path: &str) -> String {
+        self.v2_url(&format!("admin/{}", path.trim_start_matches('/')))
     }
 
     fn expand_paths(&mut self) -> Result<()> {
@@ -425,5 +429,25 @@ mod tests {
 
         // Should pass validation
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_v2_url_ignores_v1_api_version_and_trims_slashes() {
+        let mut config = Config::default();
+        config.server.url = "http://127.0.0.1:8080///".to_string();
+        config.server.api_version = "v1".to_string();
+
+        assert_eq!(
+            config.v2_url("cleanup-expired"),
+            "http://127.0.0.1:8080/v2/cleanup-expired"
+        );
+        assert_eq!(
+            config.v2_url("/cleanup-expired"),
+            "http://127.0.0.1:8080/v2/cleanup-expired"
+        );
+        assert_eq!(
+            config.admin_url("/backup"),
+            "http://127.0.0.1:8080/v2/admin/backup"
+        );
     }
 }

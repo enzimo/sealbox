@@ -229,7 +229,7 @@ sealbox-cli secret set <key> [value] [OPTIONS]
 **TTL Behavior:**
 - Expired secrets are automatically deleted when accessed (lazy cleanup)
 - Server also cleans expired secrets on startup
-- Use admin cleanup endpoint for immediate batch removal
+- Use `sealbox-cli secret cleanup-expired` for immediate batch removal in your tenant (or `DELETE /v2/admin/cleanup-expired` for all tenants)
 
 **Examples:**
 ```bash
@@ -331,6 +331,45 @@ sealbox-cli secret delete old_password
 
 # Delete specific version
 sealbox-cli secret delete old_password --version 1
+```
+
+### `secret cleanup-expired`
+
+Remove all expired records for the calling tenant by calling `DELETE /v2/cleanup-expired`.
+
+```bash
+sealbox-cli secret cleanup-expired [OPTIONS]
+```
+
+**Options (global):**
+- `--output <format>` - Output format: `table` (default), `json`, `yaml`
+- `--url <url>` - Server URL (overrides config)
+- `--token <token>` - Tenant authentication token (overrides config; prefer `SEALBOX_TOKEN_FILE` in scripts so the token does not appear on the process command line)
+
+**Behavior:**
+- **Scope:** Although nested under `secret`, this removes all expired **secrets, credentials, and files** belonging to the calling tenant (all three are stored in the tenant's secrets table). Cleanup removes only expired versions; older versions without expiry stay and the newest of them becomes current. Unexpired records, records without a TTL, and other tenants' records are untouched.
+- **Count semantics:** `deleted_count` counts deleted **stored versions (rows)**, not distinct keys. For example, a key with three expired versions contributes `3` to `deleted_count`.
+- **Auth and keys:** Requires only the server URL and a **tenant token**; local RSA public/private key files are not read or required. The server root token (`AUTH_TOKEN`) is rejected with HTTP `401`.
+- **Output:** Prints only the formatted cleanup summary to stdout (no extra banner or info lines). With `--output json`, stdout is the pretty-printed server JSON object with `deleted_count` and `cleaned_at` (Unix seconds).
+- **Timeouts and retries:** Uses a 10-second connect timeout and a 60-second total request timeout. A connect timeout exits `1` (`Failed to request server`) before any request is sent. A request timeout or a stalled response body also exits `1` (`Failed to request server` or `Failed to parse server response`) with empty stdout, leaving the server outcome unknown because the server may have already committed or may still finish deleting under its database lock. The operation is idempotent, so re-running is safe; `deleted_count` reports only what that single call removed, not everything removed since the last successful call.
+- **Exit codes:** Exits `0` on success. Runtime failures (missing token, invalid `--api-version`, HTTP/auth error such as `401`, network/timeout error, or malformed/stalled response body) exit `1` with empty stdout and the error message (including the HTTP status code on server errors) on stderr. Usage errors (unknown flag, extra positional argument, or an invalid `--output` value) exit `2` with empty stdout and usage text on stderr before any request is made. An older `sealbox-cli` binary that predates this subcommand also exits `2` with `unrecognized subcommand` on stderr, which callers can check to detect an older CLI.
+
+**Examples:**
+```bash
+# Interactive cleanup using configured tenant settings (table output)
+sealbox-cli secret cleanup-expired
+
+# Scripted / periodic janitor run using a token file and JSON output
+SEALBOX_URL=http://localhost:8080 \
+SEALBOX_TOKEN_FILE=/secure/tenant/token \
+sealbox-cli secret cleanup-expired --output json
+# {
+#   "deleted_count": 3,
+#   "cleaned_at": 1700000000
+# }
+
+# YAML output
+sealbox-cli secret cleanup-expired --output yaml
 ```
 
 ### `secret export`
@@ -558,7 +597,7 @@ TTL allows secrets to automatically expire and be deleted:
 - Set TTL in seconds when storing secrets with `--ttl <seconds>`
 - Expired secrets are deleted when accessed (lazy cleanup)
 - Server cleans expired secrets on startup
-- Manual cleanup available via admin API
+- Manual cleanup is available per tenant via `sealbox-cli secret cleanup-expired` (or `DELETE /v2/cleanup-expired`) and across all tenants via the root admin API (`DELETE /v2/admin/cleanup-expired`)
 
 **Use cases:**
 - **Temporary tokens**: API keys that should expire quickly
@@ -568,18 +607,26 @@ TTL allows secrets to automatically expire and be deleted:
 
 ### Manual Cleanup
 
-There is no CLI command for this; call the API directly:
+For a single tenant, run `sealbox-cli secret cleanup-expired` with a tenant token (no local key files required). It removes all expired secrets, credentials, and files in that tenant, counts deleted stored versions (rows), and rejects the root token with HTTP `401`. For scripts, pass the token through `SEALBOX_TOKEN_FILE` instead of `--token`:
 
 ```bash
-# Expired secrets in your tenant (tenant token)
-curl -X DELETE -H "Authorization: Bearer $TENANT_TOKEN" \
-  http://localhost:8080/v2/cleanup-expired
+# Expired records in your tenant (tenant token, table output)
+sealbox-cli secret cleanup-expired
 
-# Expired secrets in every tenant (root token)
+# Scripted run with a token file and exact JSON output
+SEALBOX_URL=http://localhost:8080 \
+SEALBOX_TOKEN_FILE=/secure/tenant/token \
+sealbox-cli secret cleanup-expired --output json
+```
+
+All-tenant cleanup has no CLI command; call the root admin API directly:
+
+```bash
+# Expired records in every tenant (root token, API-only)
 curl -X DELETE -H "Authorization: Bearer $AUTH_TOKEN" \
   http://localhost:8080/v2/admin/cleanup-expired
 
-# Response shows cleanup statistics
+# JSON response shape (for both the CLI --output json and the API)
 {
   "deleted_count": 15,
   "cleaned_at": 1640995200
@@ -677,10 +724,9 @@ CLI commands can be configured using environment variables:
 ## Exit Codes
 
 - `0` - Success
-- `1` - General error
-- `2` - Authentication error
-- `3` - Network/connection error
-- `4` - File/configuration error
+- `1` - Error (authentication, HTTP/server, network/timeout, or file/configuration error — including an invalid `--api-version` value; details are written to stderr)
+- `2` - Usage error (unknown subcommand such as `unrecognized subcommand` on an older CLI, unknown flag, missing required argument, or an invalid parser-validated option such as `--output`; reported before any request is made)
+
 ## Server Backup Commands
 
 ### `admin backup`

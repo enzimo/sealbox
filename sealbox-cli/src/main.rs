@@ -252,6 +252,8 @@ enum SecretCommands {
         /// Secret key name
         key: String,
     },
+    /// Delete expired secrets, credentials, and files for the current tenant
+    CleanupExpired,
     /// Import secrets from an encrypted Sealbox archive
     ///
     /// Key-protected archives are decrypted with the private key they were
@@ -475,6 +477,24 @@ enum TenantTokenCommands {
     Revoke { tenant_id: String, token_id: String },
 }
 
+fn uses_data_api(command: &Commands) -> bool {
+    // Only commands that honor `api_version` go through v1/v2 selection;
+    // admin, tenant, and `secret cleanup-expired` always call v2.
+    match command {
+        Commands::Secret {
+            command: SecretCommands::CleanupExpired,
+        } => false,
+        Commands::Key { .. }
+        | Commands::Secret { .. }
+        | Commands::Credential { .. }
+        | Commands::File { .. } => true,
+        Commands::Config { .. }
+        | Commands::Password { .. }
+        | Commands::Tenant { .. }
+        | Commands::Admin { .. } => false,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -502,15 +522,7 @@ async fn main() -> Result<()> {
         config.output.format = output.into();
     }
 
-    // Only data commands go through `api_version`; admin/tenant always use v2.
-    let uses_data_api = matches!(
-        cli.command,
-        Commands::Key { .. }
-            | Commands::Secret { .. }
-            | Commands::Credential { .. }
-            | Commands::File { .. }
-    );
-    if uses_data_api && config.server.api_version == "v1" {
+    if uses_data_api(&cli.command) && config.server.api_version == "v1" {
         eprintln!("⚠️  {LEGACY_V1_WARNING}");
     }
 
@@ -671,6 +683,40 @@ mod tests {
             }
             _ => panic!("Expected secret delete command"),
         }
+    }
+
+    #[test]
+    fn test_parse_secret_cleanup_expired() {
+        let cli = Cli::try_parse_from(["sealbox", "secret", "cleanup-expired"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Secret {
+                command: SecretCommands::CleanupExpired,
+            }
+        ));
+        assert!(cli.output.is_none());
+
+        let cli = Cli::try_parse_from([
+            "sealbox",
+            "secret",
+            "cleanup-expired",
+            "--output",
+            "json",
+            "--url",
+            "http://127.0.0.1:8080",
+            "--token",
+            "tenant-token",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Secret {
+                command: SecretCommands::CleanupExpired,
+            }
+        ));
+        assert!(matches!(cli.output, Some(OutputFormatArg::Json)));
+        assert_eq!(cli.url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(cli.token.as_deref(), Some("tenant-token"));
     }
 
     #[test]
@@ -943,6 +989,19 @@ mod tests {
             }
             _ => panic!("Expected admin backup command"),
         }
+    }
+
+    #[test]
+    fn test_uses_data_api_excludes_cleanup_expired() {
+        let cleanup = Cli::try_parse_from(["sealbox", "secret", "cleanup-expired"]).unwrap();
+        assert!(!uses_data_api(&cleanup.command));
+
+        let secret_list = Cli::try_parse_from(["sealbox", "secret", "list"]).unwrap();
+        assert!(uses_data_api(&secret_list.command));
+
+        let admin_backup =
+            Cli::try_parse_from(["sealbox", "admin", "backup", "--file", "sealbox.db"]).unwrap();
+        assert!(!uses_data_api(&admin_backup.command));
     }
 
     #[test]
